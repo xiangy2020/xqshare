@@ -6,10 +6,10 @@
 
 使用示例:
     # 获取单只股票实时行情
-    python examples/get_tick_data.py --host 192.168.1.100 --codes "000001.SZ"
+    python examples/get_tick_data.py --host 21.214.136.216 --codes "000001.SZ"
 
     # 获取多只股票实时行情
-    python examples/get_tick_data.py --host 192.168.1.100 --codes "000001.SZ,600000.SH,000002.SZ"
+    python examples/get_tick_data.py --host 21.214.136.216 --codes "000001.SZ,600000.SH,000002.SZ"
 """
 
 import argparse

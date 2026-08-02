@@ -7,13 +7,13 @@
 
 使用示例:
     # 订阅60秒（默认）
-    python examples/subscribe_quote.py --host 192.168.1.100 --codes "000001.SZ,600000.SH"
+    python examples/subscribe_quote.py --host 21.214.136.216 --codes "000001.SZ,600000.SH"
 
     # 订阅120秒
-    python examples/subscribe_quote.py --host 192.168.1.100 --codes "000001.SZ" --duration 120
+    python examples/subscribe_quote.py --host 21.214.136.216 --codes "000001.SZ" --duration 120
 
     # 持续订阅（Ctrl+C 停止）
-    python examples/subscribe_quote.py --host 192.168.1.100 --codes "000001.SZ" --duration 0
+    python examples/subscribe_quote.py --host 21.214.136.216 --codes "000001.SZ" --duration 0
 """
 
 import argparse

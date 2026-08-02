@@ -47,7 +47,7 @@ description: xqshare 行情数据命令行工具，获取股票列表、K线、�
 - 已安装 xqshare：`pip install xqshare`
 - 已配置环境变量（推荐）：
   ```bash
-  export XQSHARE_REMOTE_HOST="192.168.1.100"
+  export XQSHARE_REMOTE_HOST="21.214.136.216"
   export XQSHARE_CLIENT_SECRET="your-secret"
   ```
 

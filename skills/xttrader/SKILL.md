@@ -46,7 +46,7 @@ description: xqshare 交易命令行工具，查询持仓、资产、下单、�
 - 已安装 xqshare：`pip install xqshare`
 - 已配置环境变量（推荐）：
   ```bash
-  export XQSHARE_REMOTE_HOST="192.168.1.100"
+  export XQSHARE_REMOTE_HOST="21.214.136.216"
   export XQSHARE_CLIENT_SECRET="your-secret"
   export QMT_ACCOUNT_ID="你的资金账号"
   export QMT_USERDATA_PATH="C:\\QMT\\userdata_mini"
@@ -86,7 +86,7 @@ xttrader [全局参数] <command> [API参数]
 ### 查询持仓
 ```bash
 xttrader query_stock_positions
-xttrader --account-id "12345678" query_stock_positions
+xttrader  query_stock_positions
 ```
 
 ### 查询资产

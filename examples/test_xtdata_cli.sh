@@ -5,7 +5,7 @@
 #   ./test_xtdata_cli.sh                    # 默认: json格式, compact模式
 #   ./test_xtdata_cli.sh --format text      # 使用 text 格式
 #   ./test_xtdata_cli.sh --no-compact       # 不使用 compact 模式
-#   ./test_xtdata_cli.sh --host 192.168.1.100 --port 18812
+#   ./test_xtdata_cli.sh --host 21.214.136.216 --port 18812
 #   ./test_xtdata_cli.sh --limit 5          # 限制输出条数
 #   ./test_xtdata_cli.sh --verbose          # 显示详细日志
 #   ./test_xtdata_cli.sh --skip-download    # 跳过下载步骤

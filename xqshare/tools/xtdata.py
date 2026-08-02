@@ -11,7 +11,7 @@ xtdata - 行情数据命令行工具
 使用示例:
     # 工具参数在 command 之前
     xtdata --limit 100 get_stock_list_in_sector --sector-name "沪深A股"
-    xtdata --host 192.168.1.100 get_full_tick --codes "000001.SZ"
+    xtdata --host 21.214.136.216 get_full_tick --codes "000001.SZ"
 
     # 使用环境变量配置连接，只传 API 参数
     xtdata get_market_data_ex --codes "000001.SZ" --period 1d
@@ -26,12 +26,32 @@ from .common import (
 )
 
 
+def _get_xtdata_commands():
+    """从权限配置中提取可用的 xtdata 命令列表"""
+    try:
+        from ..auth import API_PERMISSIONS
+    except Exception:
+        return []
+    commands = sorted({
+        name.split(".", 1)[1]
+        for name in API_PERMISSIONS
+        if name.startswith("xtdata.") and "." not in name.split(".", 1)[1]
+    })
+    # 命令行不支持 subscribe 类订阅命令
+    return [cmd for cmd in commands if not cmd.startswith("subscribe")]
+
+
 def main():
+    commands = _get_xtdata_commands()
+    command_help = "API函数名"
+    if commands:
+        command_help += "，可选值:\n  " + ", ".join(commands)
+
     parser = argparse.ArgumentParser(
         prog="xtdata",
         description="xtquant 行情数据命令行工具",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
+        epilog=f"""
 参数规则:
   工具参数 (--host, --port, --limit 等) 必须放在 command 之前
   API 函数参数放在 command 之后
@@ -40,16 +60,43 @@ def main():
   不支持以 subscribe 开头的命令（订阅功能需要回调）
   不支持 callback 参数（回调功能需要使用 Python API）
 
+可用命令:
+  {", ".join(commands) if commands else "(无法获取命令列表)"}
+
 示例:
   xtdata --limit 100 get_stock_list_in_sector --sector-name "沪深A股"
-  xtdata --host 192.168.1.100 get_full_tick --codes "000001.SZ"
+  xtdata --host 21.214.136.216 get_full_tick --codes "000001.SZ"
         """
     )
     add_global_args(parser)
-    parser.add_argument("command", help="API函数名")
+    parser.add_argument(
+        "command",
+        nargs="?",
+        choices=commands if commands else None,
+        help=command_help,
+    )
+    parser.add_argument(
+        "--list-commands",
+        action="store_true",
+        help="列出所有可用的 xtdata 命令并退出",
+    )
     parser.add_argument("args", nargs=argparse.REMAINDER, help="函数参数 (--key value)")
 
     args = parser.parse_args()
+
+    if args.list_commands:
+        if commands:
+            print("可用的 xtdata 命令:")
+            for cmd in commands:
+                print(f"  {cmd}")
+        else:
+            print("未能获取命令列表", file=sys.stderr)
+            sys.exit(1)
+        sys.exit(0)
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
 
     # 补充环境变量默认值
     output_format = args.output_format or os.environ.get(ENV_FORMAT, "text")
@@ -77,7 +124,8 @@ def main():
     with create_client(args.host, args.port, args.secret, args.client_id, quiet=not args.verbose) as xt:
         func = getattr(xt.xtdata, args.command, None)
         if func is None:
-            print(f"错误: 未知命令 '{args.command}'", file=sys.stderr)
+            print(f"错误: 命令 '{args.command}' 在当前服务端 xtquant 中不可用", file=sys.stderr)
+            print("提示: 请确认服务端 xtquant 版本是否包含此 API，或使用 --list-commands 查看支持的命令", file=sys.stderr)
             sys.exit(1)
 
         params = parse_kv_args(args.args)

@@ -17,13 +17,13 @@
 
 使用示例:
     # 使用环境变量配置（推荐）
-    export XQSHARE_REMOTE_HOST="192.168.1.100"
+    export XQSHARE_REMOTE_HOST="21.214.136.216"
     export QMT_ACCOUNT_ID="12345678"
     export QMT_USERDATA_PATH="C:\\QMT\\userdata_mini"
     python examples/query_positions.py
 
     # 命令行参数（覆盖环境变量）
-    python examples/query_positions.py --account-id "12345678" --path "C:\\QMT\\userdata_mini"
+    python examples/query_positions.py  --path "C:\\QMT\\userdata_mini"
 
     # 查询信用账户持仓
     python examples/query_positions.py --account-type CREDIT

@@ -7,16 +7,16 @@
 
 使用示例:
     # 下载默认股票的日K线（000001.SZ, 600000.SH）
-    python examples/download_history_data.py --host 192.168.1.100
+    python examples/download_history_data.py --host 21.214.136.216
 
     # 下载指定股票
-    python examples/download_history_data.py --host 192.168.1.100 --codes "000001.SZ,600000.SH"
+    python examples/download_history_data.py --host 21.214.136.216 --codes "000001.SZ,600000.SH"
 
     # 下载指定日期范围的数据
-    python examples/download_history_data.py --host 192.168.1.100 --codes "000001.SZ" --start 20250101 --end 20260228
+    python examples/download_history_data.py --host 21.214.136.216 --codes "000001.SZ" --start 20250101 --end 20260228
 
     # 下载1分钟K线
-    python examples/download_history_data.py --host 192.168.1.100 --codes "000001.SZ" --period 1m
+    python examples/download_history_data.py --host 21.214.136.216 --codes "000001.SZ" --period 1m
 """
 
 import argparse

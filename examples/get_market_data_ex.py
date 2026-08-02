@@ -7,13 +7,13 @@ get_market_data_ex 返回格式更直观：{stock: DataFrame}，DataFrame 的 in
 
 使用示例:
     # 获取日K线（默认近30天）
-    python examples/get_market_data_ex.py --host 192.168.1.100 --codes "000001.SZ,600000.SH"
+    python examples/get_market_data_ex.py --host 21.214.136.216 --codes "000001.SZ,600000.SH"
 
     # 获取指定日期范围的日K线
-    python examples/get_market_data_ex.py --host 192.168.1.100 --codes "000001.SZ" --start 20260101 --end 20260228
+    python examples/get_market_data_ex.py --host 21.214.136.216 --codes "000001.SZ" --start 20260101 --end 20260228
 
     # 获取1分钟K线
-    python examples/get_market_data_ex.py --host 192.168.1.100 --codes "000001.SZ" --period 1m
+    python examples/get_market_data_ex.py --host 21.214.136.216 --codes "000001.SZ" --period 1m
 """
 
 import argparse

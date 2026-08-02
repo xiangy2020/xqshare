@@ -184,14 +184,14 @@ class TestClientEnvConfig:
         with patch('xqshare.client.rpyc.connect', return_value=mock_conn):
             with patch('xqshare.client.BgServingThread'):
                 with patch.dict(os.environ, {
-                    "XQSHARE_REMOTE_HOST": "192.168.1.100",
+                    "XQSHARE_REMOTE_HOST": "21.214.136.216",
                     "XQSHARE_REMOTE_PORT": "18888",
                     "XQSHARE_CLIENT_ID": "env-client",
                     "XQSHARE_CLIENT_SECRET": "env-secret"
                 }):
                     client = XtQuantRemote(heartbeat_interval=0)
 
-                    assert client._host == "192.168.1.100"
+                    assert client._host == "21.214.136.216"
                     assert client._port == 18888
                     assert client._client_id == "env-client"
                     assert client._client_secret == "env-secret"

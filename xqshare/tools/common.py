@@ -9,6 +9,7 @@ import json
 import ast
 import argparse
 from contextlib import contextmanager
+from pathlib import Path
 
 # 环境变量名
 ENV_HOST = "XQSHARE_REMOTE_HOST"
@@ -17,6 +18,24 @@ ENV_SECRET = "XQSHARE_CLIENT_SECRET"
 ENV_CLIENT_ID = "XQSHARE_CLIENT_ID"
 ENV_FORMAT = "XQSHARE_FORMAT"
 
+# 显式加载 .env，按优先级依次查找：
+# 1. 当前工作目录下的 .env（方便用户在任意目录执行命令时使用本地配置）
+# 2. 项目根目录下的 .env（开发调试时使用源码目录的配置）
+# 3. 用户主目录下的 .env.xqshare（全局兜底配置）
+_CANDIDATE_ENV_PATHS = [
+    Path.cwd() / ".env",
+    Path(__file__).resolve().parents[2] / ".env",
+    Path.home() / ".env.xqshare",
+]
+
+for _env_path in _CANDIDATE_ENV_PATHS:
+    if _env_path.exists():
+        try:
+            from dotenv import load_dotenv
+            load_dotenv(_env_path, override=True)
+            break
+        except ImportError:
+            pass
 
 @contextmanager
 def create_client(host=None, port=None, secret=None, client_id=None, quiet=True):
@@ -168,7 +187,16 @@ def parse_kv_args(args_list):
 def preprocess_params(params):
     """预处理复杂参数（JSON/Python 字面量反序列化）"""
     # 需要转换为整数的参数名
-    INT_PARAMS = {'count', 'limit', 'n', 'offset'}
+    INT_PARAMS = {
+        'count', 'limit', 'n', 'offset',
+        # 交易相关整数参数
+        'order_type', 'order_volume', 'price_type',
+        'order_id', 'market', 'sysid',
+    }
+    # 需要转换为浮点数的参数名
+    FLOAT_PARAMS = {
+        'price',
+    }
 
     for key, value in params.items():
         if not isinstance(value, str):
@@ -194,6 +222,14 @@ def preprocess_params(params):
         if key in INT_PARAMS:
             try:
                 params[key] = int(value)
+                continue
+            except ValueError:
+                pass
+
+        # 特定的浮点数参数
+        if key in FLOAT_PARAMS:
+            try:
+                params[key] = float(value)
                 continue
             except ValueError:
                 pass
@@ -247,20 +283,34 @@ def _format_as_json(result):
         if _is_remote_object(result):
             result = list(result)
         return [_format_as_json(item) for item in result]
-    elif hasattr(result, '__dict__'):
-        # 对于远程对象，直接使用 __dict__ 避免 dir() 遍历
-        if _is_remote_object(result):
-            try:
-                attrs = result.__dict__
-                if isinstance(attrs, dict):
-                    return {k: _format_as_json(v) for k, v in attrs.items()
-                            if not k.startswith('_')}
-            except Exception:
-                pass
-        # 本地对象：使用 dir() 遍历
-        return {attr: _format_as_json(getattr(result, attr))
-                for attr in dir(result)
-                if not attr.startswith('_') and not callable(getattr(result, attr))}
+    elif hasattr(result, '__dict__') or hasattr(result, '__slots__'):
+        # 对于 xtquant C 扩展对象或远程对象，使用 dir() 逐个获取属性
+        try:
+            attrs = dir(result)
+            data = {}
+            for attr in attrs:
+                if attr.startswith('_'):
+                    continue
+                try:
+                    value = getattr(result, attr)
+                    if callable(value):
+                        continue
+                    data[attr] = _format_as_json(value)
+                except Exception:
+                    continue
+            if data:
+                return data
+        except Exception:
+            pass
+        # 兜底：尝试 __dict__
+        try:
+            attrs = getattr(result, '__dict__', None)
+            if isinstance(attrs, dict):
+                return {k: _format_as_json(v) for k, v in attrs.items()
+                        if not k.startswith('_')}
+        except Exception:
+            pass
+        return str(result)
     elif isinstance(result, datetime):
         return result.isoformat()
     else:
@@ -282,6 +332,8 @@ def _format_as_text(result, limit=None):
         pd.set_option('display.width', None)
         output.write(result.to_string())
     elif isinstance(result, dict):
+        if not result:
+            output.write("# 空对象\n")
         has_dataframe = any(isinstance(v, pd.DataFrame) for v in result.values())
         if has_dataframe:
             for key, value in result.items():
@@ -294,14 +346,19 @@ def _format_as_text(result, limit=None):
             output.write(pformat(result))
     elif isinstance(result, (list, tuple)):
         total = len(result)
-        display = result[:limit] if limit and total > limit else result
-        for i, item in enumerate(display, 1):
-            if hasattr(item, '__dict__') or hasattr(item, '__slots__'):
-                output.write(f"[{i}] {_format_object_attrs(item)}\n")
-            else:
-                output.write(f"[{i}] {item}\n")
-        if limit and total > limit:
-            output.write(f"\n# 共 {total} 条，已显示前 {limit} 条")
+        if total == 0:
+            output.write(f"# 共 {total} 条\n")
+        else:
+            display = result[:limit] if limit and total > limit else result
+            for i, item in enumerate(display, 1):
+                if hasattr(item, '__dict__') or hasattr(item, '__slots__'):
+                    output.write(f"[{i}] {_format_object_attrs(item)}\n")
+                else:
+                    output.write(f"[{i}] {item}\n")
+            if limit and total > limit:
+                output.write(f"\n# 共 {total} 条，已显示前 {limit} 条")
+    elif hasattr(result, '__dict__') or hasattr(result, '__slots__'):
+        output.write(pformat(_format_object_attrs(result)))
     else:
         output.write(pformat(result))
 
@@ -434,24 +491,10 @@ def create_trader(xt, userdata_path, account_id, account_type):
     if not account_id:
         raise ValueError("必须提供 account_id 参数或设置 QMT_ACCOUNT_ID 环境变量")
 
-    # 创建交易实例（使用服务端方法）
-    trader = xt.create_trader(userdata_path)
-
-    # 启动交易线程
-    trader.start()
+    # 创建交易实例并等待真实连接建立（服务端会等待 on_connected 回调）
+    trader = xt.create_trader_and_connect(userdata_path)
 
     # 创建账户对象
     account = xt.xttype.StockAccount(account_id, account_type)
-
-    # 连接交易服务器
-    result = trader.connect()
-    if result != 0:
-        error_codes = {
-            -1: "交易服务器未连接",
-            -2: "账号未登录",
-            -3: "请求超时",
-            -4: "资金账号不存在",
-        }
-        raise ConnectionError(f"连接失败: {error_codes.get(result, f'错误码 {result}')}")
 
     return trader, account

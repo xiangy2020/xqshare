@@ -4,7 +4,7 @@ XtQuant Share (xqshare) - Transparent remote proxy for xtquant library
 Allows using xtquant on macOS/Linux by proxying calls to a Windows server.
 """
 
-__version__ = "1.1.1"
+__version__ = "1.2.31"
 __author__ = "Jason Hu"
 
 from .client import (
@@ -16,6 +16,7 @@ from .client import (
     xttrader,
     xttype,
     xtview,
+    datadir,
     ConnectionError,
     AuthenticationError,
     CallbackError,
@@ -30,6 +31,7 @@ __all__ = [
     "xttrader",
     "xttype",
     "xtview",
+    "datadir",
     "ConnectionError",
     "AuthenticationError",
     "CallbackError",

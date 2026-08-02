@@ -69,7 +69,7 @@ python -m xqshare.server
 ### 客户端快速测试
 
 ```bash
-export XQSHARE_REMOTE_HOST="192.168.1.100"
+export XQSHARE_REMOTE_HOST="21.214.136.216"
 xtdata get_stock_list_in_sector --sector-name "沪深A股" --limit 10
 ```
 
@@ -94,8 +94,11 @@ xtdata --limit 100 get_stock_list_in_sector --sector-name "沪深A股"
 # 获取K线数据
 xtdata get_market_data_ex --stock-list "['000001.SZ']" --period "1d" --start-time "20260101" --end-time "20260228"
 
+# 获取交易日历
+xtdata get_trading_calendar --market SH --start-time "20260101" --end-time "20261231"
+
 # 获取实时行情
-xtdata get_full_tick --stock-list "['000001.SZ', '600000.SH']"
+xtdata get_full_tick --code-list "['000001.SZ', '600000.SH']"
 ```
 
 ### xttrader - 交易工具
@@ -105,13 +108,20 @@ xtdata get_full_tick --stock-list "['000001.SZ', '600000.SH']"
 xttrader --help
 
 # 查询持仓（需要设置账号）
-xttrader --account-id "12345678" query_stock_positions
+xttrader  query_stock_positions
 
 # 查询资产
-xttrader --account-id "12345678" query_stock_asset
+xttrader  query_stock_asset
 
 # 下单（需要更多参数）
-xttrader --account-id "12345678" order_stock --stock-code "000001.SZ" --order-type 23 --order-volume 100
+xttrader  order_stock --stock-code "000001.SZ" --order-type 23 --order-volume 100 --price-type 11 --price 10.0
+
+# 追踪订单
+xttrader  query_stock_orders
+xttrader  query_stock_trades
+
+# 撤单（order-id 替换为实际订单号）
+xttrader  order_cancel --order-id 1082130745
 ```
 
 ### 全局参数
@@ -149,7 +159,7 @@ xttrader --account-id "12345678" order_stock --stock-code "000001.SZ" --order-ty
 **推荐：使用环境变量配置（避免敏感信息泄露）**
 ```bash
 # 设置环境变量
-export XQSHARE_REMOTE_HOST="192.168.1.100"
+export XQSHARE_REMOTE_HOST="21.214.136.216"
 export XQSHARE_CLIENT_SECRET="your-secret"
 
 # 获取股票列表
@@ -181,10 +191,10 @@ python examples/query_positions.py
 **备选：命令行参数（覆盖环境变量）:**
 ```bash
 # 显式指定服务端地址
-python examples/get_stock_list.py --host 192.168.1.100 --sector "沪深300"
+python examples/get_stock_list.py --host 21.214.136.216 --sector "沪深300"
 
 # 显式指定认证密钥
-python examples/get_tick_data.py --host 192.168.1.100 --secret "your-secret" --codes "000001.SZ"
+python examples/get_tick_data.py --host 21.214.136.216 --secret "your-secret" --codes "000001.SZ"
 
 # 查看帮助
 python examples/get_stock_list.py --help
@@ -198,11 +208,11 @@ python examples/get_stock_list.py --help
 from xqshare import XtQuantRemote, connect, disconnect, xtdata, xttrader, xttype
 
 # 方式1：类实例（推荐）
-with XtQuantRemote("192.168.1.100", client_secret="xxx") as xt:
+with XtQuantRemote("21.214.136.216", client_secret="xxx") as xt:
     stocks = xt.xtdata.get_stock_list_in_sector("沪深A股")
 
 # 方式2：全局便捷函数
-connect(host="192.168.1.100", client_secret="xxx")
+connect(host="21.214.136.216", client_secret="xxx")
 stocks = xtdata.get_stock_list_in_sector("沪深A股")
 disconnect()
 ```
@@ -210,9 +220,97 @@ disconnect()
 **核心属性/方法：**
 - `xt.xtdata` - 行情数据模块
 - `xt.xttype` - 类型定义模块（StockAccount 等）
-- `xt.create_trader()` - 创建交易实例
+- `xt.datadir` - QMT datadir 文件解析模块（无需 miniQMT 进程）
+- `xt.create_trader()` - 创建交易实例（需自行 connect）
+- `xt.create_trader_and_connect()` - 创建交易实例并等待真实连接建立（推荐用于下单）
 
-详细 API 请查看 [xqshare/client.py](xqshare/client.py) 源码。
+📖 **详细 API 文档：** [doc/xqshare-api.md](doc/xqshare-api.md) — 包含所有接口的完整参数说明、返回值、异常及代码示例。
+
+---
+
+## datadir 文件解析功能
+
+`xqshare.datadir` 将 Windows 端 QMT `datadir` 目录的**直接文件解析能力**通过 RPyC 透明暴露给 Mac/Linux 端，无需 miniQMT 进程即可读取 K 线、板块等数据，作为 `xtdata` API 的补充数据源。
+
+### 架构
+
+```
+Mac/Linux                              Windows
+┌──────────────────────────┐  RPyC     ┌──────────────────────────────┐
+│  xqshare.xtdata          │ ────────► │  xtdata（原生 xtquant）       │
+│  xqshare.datadir  ← 新增 │ ────────► │  QmtDataReader(datadir/)     │
+└──────────────────────────┘           │  （直接读取本地 .DAT 文件）    │
+                                       └──────────────────────────────┘
+```
+
+### Server 端配置（Windows）
+
+在 `.env` 文件中配置 datadir 路径：
+
+```ini
+# [可选] QMT datadir 目录路径（用于文件解析功能）
+# 若不配置，server 启动时会尝试通过 xtdata.get_data_dir() 自动推断
+QMT_DATADIR_PATH=D:\国金证券QMT交易端\datadir
+```
+
+> **自动推断规则**：若未配置 `QMT_DATADIR_PATH`，server 会尝试调用 `xtdata.get_data_dir()` 获取默认路径，并自动将 `userdata_mini\datadir` 替换为 `datadir`（主数据目录，数据更全）。
+
+### Client 端使用
+
+```python
+from xqshare import XtQuantRemote
+
+with XtQuantRemote("21.214.136.216", client_secret="my-secret") as xt:
+    # 读取 K 线数据（直接解析 .DAT 文件，无需 miniQMT 进程）
+    df = xt.datadir.kline("600000.SH", "1d")
+    print(df.tail())
+
+    # 读取 5 分钟线
+    df5m = xt.datadir.kline("000001.SZ", "5m")
+
+    # 获取板块分类列表
+    categories = xt.datadir.sector_categories()
+    print(categories)  # ['申万行业', '证监会行业', ...]
+
+    # 获取某分类下所有板块成分股
+    sw_sectors = xt.datadir.sectors("申万行业")  # {板块名: [代码列表]}
+
+    # 获取单个板块成分股
+    bank_stocks = xt.datadir.sector("申万行业", "SW1银行")
+    print(f"银行板块：{len(bank_stocks)} 只")
+```
+
+### 全局便捷方式
+
+```python
+import xqshare
+
+xqshare.connect(host="21.214.136.216", client_secret="my-secret")
+
+# 与 xqshare.xtdata 用法完全对称
+df = xqshare.datadir.kline("600000.SH", "1d")
+```
+
+### 与 xtdata 的对比
+
+| 特性 | `xqshare.xtdata` | `xqshare.datadir` |
+|------|-----------------|-------------------|
+| 数据来源 | miniQMT 进程 API | 直接解析 .DAT 文件 |
+| 是否需要 miniQMT 运行 | ✅ 必须 | ❌ 不需要 |
+| 支持实时行情 | ✅ 支持 | ❌ 不支持 |
+| 支持历史 K 线 | ✅ 支持 | ✅ 支持 |
+| 支持板块成分股 | ✅ 支持 | ✅ 支持 |
+| 适用场景 | 实时/在线场景 | 离线/备用/批量场景 |
+
+### datadir 不可用时的处理
+
+若 server 端未配置 `QMT_DATADIR_PATH` 且无法自动推断，调用 `datadir` 相关方法时会抛出 `RuntimeError`，包含明确的配置提示：
+
+```
+RuntimeError: datadir 不可用：未配置 QMT_DATADIR_PATH 且无法自动推断路径
+路径：<未配置>
+请在 server 端 .env 中配置 QMT_DATADIR_PATH，或确认 xtdata.get_data_dir() 可用。
+```
 
 ---
 
@@ -221,7 +319,7 @@ disconnect()
 ```python
 from xqshare import XtQuantRemote
 
-with XtQuantRemote("192.168.1.100", client_secret="my-secret") as xt:
+with XtQuantRemote("21.214.136.216", client_secret="my-secret") as xt:
     # 获取股票列表
     stocks = xt.xtdata.get_stock_list_in_sector("沪深A股")
     print(f"股票数量: {len(stocks)}")
@@ -244,16 +342,13 @@ with XtQuantRemote("192.168.1.100", client_secret="my-secret") as xt:
 ```python
 from xqshare import XtQuantRemote
 
-with XtQuantRemote("192.168.1.100", client_secret="my-secret") as xt:
-    # 创建交易实例（已自动 start）
+with XtQuantRemote("21.214.136.216", client_secret="my-secret") as xt:
+    # 创建交易实例并等待真实连接建立（推荐）
     # userdata_path 可通过环境变量 QMT_USERDATA_PATH 配置
-    trader = xt.create_trader("C:\\QMT\\userdata_mini")
+    trader = xt.create_trader_and_connect("C:\\QMT\\userdata_mini")
 
     # 创建账户对象
     account = xt.xttype.StockAccount("12345678", "STOCK")
-
-    # 连接交易服务器
-    trader.connect()
 
     # 查询持仓
     positions = trader.query_stock_positions(account)
@@ -329,7 +424,7 @@ logs/client_20260228.log
 **客户端也会记录调用：**
 ```python
 # 设置日志级别
-xt = XtQuantRemote("192.168.1.100", log_level="DEBUG")
+xt = XtQuantRemote("21.214.136.216", log_level="DEBUG")
 ```
 
 客户端日志示例：
@@ -411,7 +506,7 @@ python -m xqshare.server --ssl --cert server.crt --key server.key
 
 ```python
 xt = XtQuantRemote(
-    host="192.168.1.100",
+    host="21.214.136.216",
     use_ssl=True,
     ssl_verify=False  # 自签名证书需禁用验证
 )
@@ -429,7 +524,7 @@ xt = XtQuantRemote(
 
 ```python
 xt = XtQuantRemote(
-    host="192.168.1.100",
+    host="21.214.136.216",
     auto_reconnect=True,
     max_retries=10,
     heartbeat_interval=15,
@@ -600,8 +695,8 @@ tail -f logs/client_*.log
 
 ```bash
 # 检查网络
-ping 192.168.1.100
-telnet 192.168.1.100 18812
+ping 21.214.136.216
+telnet 21.214.136.216 18812
 ```
 
 ### 查看服务状态

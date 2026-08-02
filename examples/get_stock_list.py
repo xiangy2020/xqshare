@@ -6,13 +6,13 @@
 
 使用示例:
     # 获取沪深A股列表
-    python examples/get_stock_list.py --host 192.168.1.100
+    python examples/get_stock_list.py --host 21.214.136.216
 
     # 获取沪深300成分股
-    python examples/get_stock_list.py --host 192.168.1.100 --sector "沪深300"
+    python examples/get_stock_list.py --host 21.214.136.216 --sector "沪深300"
 
     # 使用认证密钥
-    python examples/get_stock_list.py --host 192.168.1.100 --secret "your-secret"
+    python examples/get_stock_list.py --host 21.214.136.216 --secret "your-secret"
 """
 
 import argparse

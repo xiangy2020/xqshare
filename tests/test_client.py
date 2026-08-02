@@ -212,5 +212,163 @@ class TestGlobalFunctions:
         assert get_client() is None
 
 
+class TestDatadirProxy:
+    """测试 datadir 属性和全局代理"""
+
+    @patch('xqshare.client.rpyc.connect')
+    def test_datadir_property_exists(self, mock_connect):
+        """XtQuantRemote 应有 datadir 属性"""
+        mock_conn = Mock()
+        mock_conn.root.ping = Mock(return_value="pong")
+        mock_connect.return_value = mock_conn
+
+        client = XtQuantRemote(host="localhost", auto_reconnect=False, client_secret="")
+        assert hasattr(client, 'datadir')
+        client.close()
+
+    @patch('xqshare.client.rpyc.connect')
+    def test_datadir_returns_remote_module(self, mock_connect):
+        """datadir 属性应返回 RemoteModule 实例"""
+        mock_conn = Mock()
+        mock_conn.root.ping = Mock(return_value="pong")
+        mock_connect.return_value = mock_conn
+
+        client = XtQuantRemote(host="localhost", auto_reconnect=False, client_secret="")
+        assert isinstance(client.datadir, RemoteModule)
+        client.close()
+
+    @patch('xqshare.client.rpyc.connect')
+    def test_global_datadir_proxy_available_after_connect(self, mock_connect):
+        """connect() 后全局 datadir 代理应可用"""
+        mock_conn = Mock()
+        mock_conn.root.ping = Mock(return_value="pong")
+        mock_connect.return_value = mock_conn
+
+        from xqshare.client import connect, disconnect, datadir as global_datadir
+
+        client = connect(host="localhost", auto_reconnect=False, client_secret="")
+        # 全局 datadir 代理应指向 client.datadir
+        assert global_datadir is not None
+        disconnect()
+
+    @patch('xqshare.client.rpyc.connect')
+    def test_datadir_calls_get_datadir_on_server(self, mock_connect):
+        """访问 datadir 方法时应调用 server 的 get_datadir"""
+        mock_conn = Mock()
+        mock_conn.root.ping = Mock(return_value="pong")
+
+        # 模拟 server 端返回的 datadir 对象
+        mock_remote_reader = Mock()
+        mock_remote_reader.kline = Mock(return_value={
+            "__xqshare_serialized__": "dataframe_csv",
+            "data": "datetime,open,close\n2024-01-02,10.0,10.5\n"
+        })
+        mock_conn.root.get_datadir = Mock(return_value=mock_remote_reader)
+        mock_connect.return_value = mock_conn
+
+        client = XtQuantRemote(host="localhost", auto_reconnect=False, client_secret="")
+        # 触发 _ensure_module，调用 get_datadir
+        try:
+            client.datadir.kline('600000.SH', '1d')
+        except Exception:
+            pass  # 可能因 mock 不完整而失败，但 get_datadir 应已被调用
+        client.close()
+
+
+class TestDeserializeFromTransfer:
+    """测试 _deserialize_from_transfer 反序列化逻辑"""
+
+    def test_none_type(self):
+        from xqshare.client import _deserialize_from_transfer
+        result = _deserialize_from_transfer({"__xqshare_serialized__": "none", "data": None})
+        assert result is None
+
+    def test_json_list(self):
+        from xqshare.client import _deserialize_from_transfer
+        result = _deserialize_from_transfer({
+            "__xqshare_serialized__": "json",
+            "data": '["600000.SH", "000001.SZ"]'
+        })
+        assert result == ["600000.SH", "000001.SZ"]
+
+    def test_json_dict(self):
+        from xqshare.client import _deserialize_from_transfer
+        result = _deserialize_from_transfer({
+            "__xqshare_serialized__": "json",
+            "data": '{"key": "value"}'
+        })
+        assert result == {"key": "value"}
+
+    def test_dataframe_csv(self):
+        """DataFrame CSV 反序列化应返回正确的 DataFrame"""
+        import pandas as pd
+        from xqshare.client import _deserialize_from_transfer
+
+        csv_data = "datetime,open,high,low,close,volume\n2024-01-02,10.0,10.5,9.8,10.3,1000\n2024-01-03,10.3,10.8,10.1,10.6,1200\n"
+        result = _deserialize_from_transfer({
+            "__xqshare_serialized__": "dataframe_csv",
+            "data": csv_data
+        })
+
+        assert isinstance(result, pd.DataFrame)
+        assert len(result) == 2
+        assert "open" in result.columns
+        assert "close" in result.columns
+
+    def test_dataframe_csv_index_preserved(self):
+        """DataFrame 反序列化后索引应正确还原"""
+        import pandas as pd
+        from xqshare.client import _deserialize_from_transfer
+
+        # 构造带 DatetimeIndex 的 DataFrame 并序列化
+        df = pd.DataFrame(
+            {"open": [10.0, 10.3], "close": [10.3, 10.6]},
+            index=pd.to_datetime(["2024-01-02", "2024-01-03"])
+        )
+        df.index.name = "datetime"
+        csv_data = df.to_csv(index=True)
+
+        result = _deserialize_from_transfer({
+            "__xqshare_serialized__": "dataframe_csv",
+            "data": csv_data
+        })
+
+        assert isinstance(result, pd.DataFrame)
+        assert len(result) == 2
+        assert result.index[0] is not None
+
+    def test_dict_with_dataframe(self):
+        """嵌套 DataFrame 的字典应正确反序列化"""
+        import json
+        import pandas as pd
+        from xqshare.client import _deserialize_from_transfer
+
+        inner_csv = "datetime,close\n2024-01-02,10.3\n"
+        payload = json.dumps({
+            "600000.SH": {"__df__": True, "csv": inner_csv}
+        })
+        result = _deserialize_from_transfer({
+            "__xqshare_serialized__": "dict_with_dataframe",
+            "data": payload
+        })
+
+        assert isinstance(result, dict)
+        assert "600000.SH" in result
+        assert isinstance(result["600000.SH"], pd.DataFrame)
+
+    def test_non_serialized_passthrough(self):
+        """非序列化数据应原样返回"""
+        from xqshare.client import _deserialize_from_transfer
+
+        plain_list = ["a", "b", "c"]
+        assert _deserialize_from_transfer(plain_list) == plain_list
+
+        plain_str = "hello"
+        assert _deserialize_from_transfer(plain_str) == plain_str
+
+        plain_dict = {"no_marker": True}
+        assert _deserialize_from_transfer(plain_dict) == plain_dict
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

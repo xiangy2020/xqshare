@@ -151,6 +151,37 @@ class CallbackError(Exception):
     pass
 
 
+class CallbackServer:
+    """客户端回调服务器
+
+    允许服务端通过 RPyC 反向调用客户端的回调函数。
+    用于接收服务端推送的异步事件（如交易回调、订阅数据等）。
+    """
+
+    def __init__(self, port=0):
+        self.port = port
+        self._callbacks = {}
+        self._lock = threading.Lock()
+
+    def register(self, callback_id: str, callback):
+        """注册回调"""
+        with self._lock:
+            self._callbacks[callback_id] = callback
+
+    def unregister(self, callback_id: str):
+        """注销回调"""
+        with self._lock:
+            self._callbacks.pop(callback_id, None)
+
+    def _invoke_callback(self, callback_id: str, *args):
+        """调用指定回调"""
+        with self._lock:
+            callback = self._callbacks.get(callback_id)
+            if callback is None:
+                raise CallbackError(f"回调不存在: {callback_id}")
+        return callback(*args)
+
+
 # ==================== 重连策略 ====================
 
 class ReconnectPolicy:
@@ -172,6 +203,72 @@ class ReconnectPolicy:
 from rpyc.utils.helpers import BgServingThread
 
 
+# ==================== Trader 远程事件回调接收器 ====================
+
+class RemoteTraderCallback:
+    """客户端接收服务端推送的 on_stock_* 事件并分发给用户回调。
+
+    通过 RPyC 反向通道暴露 exposed_on_trader_event，服务端在事件发生时调用。
+    """
+
+    SUPPORTED_EVENTS = (
+        "on_stock_asset", "on_stock_order", "on_stock_trade", "on_stock_position"
+    )
+
+    def __init__(self, module: "RemoteModule"):
+        self._module = module
+        self._lock = threading.Lock()
+        self._callbacks: Dict[str, list] = {ev: [] for ev in self.SUPPORTED_EVENTS}
+        self._running = True
+        self._queue = []
+        self._queue_lock = threading.Lock()
+        self._event_thread = threading.Thread(target=self._dispatch_loop, daemon=True)
+        self._event_thread.start()
+
+    def exposed_on_trader_event(self, event_name: str, account_id: str, payload: Any):
+        """服务端反向调用入口"""
+        if event_name not in self.SUPPORTED_EVENTS:
+            return
+        with self._queue_lock:
+            self._queue.append((event_name, account_id, payload))
+
+    def _dispatch_loop(self):
+        while self._running:
+            batch = []
+            with self._queue_lock:
+                if self._queue:
+                    batch = self._queue
+                    self._queue = []
+            if not batch:
+                time.sleep(0.01)
+                continue
+            for event_name, account_id, payload in batch:
+                callbacks = []
+                with self._lock:
+                    callbacks = list(self._callbacks.get(event_name, []))
+                for cb in callbacks:
+                    try:
+                        cb(event_name, account_id, payload)
+                    except Exception as e:
+                        logger.warning(f"[RemoteTraderCallback] 用户回调异常: {event_name} {e}")
+
+    def register(self, event_name: str, callback):
+        if event_name not in self.SUPPORTED_EVENTS:
+            raise ValueError(f"不支持的事件类型: {event_name}，可选: {self.SUPPORTED_EVENTS}")
+        with self._lock:
+            if callback not in self._callbacks[event_name]:
+                self._callbacks[event_name].append(callback)
+
+    def unregister(self, event_name: str, callback):
+        with self._lock:
+            cbs = self._callbacks.get(event_name, [])
+            if callback in cbs:
+                cbs.remove(callback)
+
+    def stop(self):
+        self._running = False
+
+
 # ==================== 远程模块代理 ====================
 
 class RemoteModule:
@@ -182,6 +279,7 @@ class RemoteModule:
         self._module_name = module_name
         self._module = module  # 支持直接传入对象
         self._logger = get_logger()
+        self._trader_callback = None  # 仅 xttrader 模块使用
 
     def _ensure_module(self):
         if self._module is None:
@@ -193,7 +291,13 @@ class RemoteModule:
                 self._module = None
                 raise
         return self._module
-    
+
+    def _get_trader_callback(self):
+        """懒初始化 trader 远程事件回调接收器"""
+        if self._module_name == 'xttrader' and self._trader_callback is None:
+            self._trader_callback = RemoteTraderCallback(self)
+        return self._trader_callback
+
     def __getattr__(self, name):
         module = self._ensure_module()
         try:
@@ -218,6 +322,20 @@ class RemoteModule:
             self._logger.info(f"[CALL] {self._module_name}.{func_name}({args_str})")
 
             try:
+                # xttrader 事件注册与订阅自动挂载远端回调
+                if self._module_name == 'xttrader':
+                    if func_name == 'register_callback':
+                        # 原生 register_callback 被服务端接管，客户端无需再传 callback 对象
+                        elapsed_ms = (time.perf_counter() - start_time) * 1000
+                        self._logger.info(f"[OK] {self._module_name}.{func_name} | {elapsed_ms:.2f}ms | ignored")
+                        return 0
+                    if func_name == 'subscribe':
+                        cb = self._get_trader_callback()
+                        kwargs.setdefault('callback', cb)
+                    if func_name == 'unsubscribe':
+                        cb = self._get_trader_callback()
+                        kwargs.setdefault('callback', cb)
+
                 result = func(*args, **kwargs)
                 # 反序列化服务端优化传输的数据
                 result = _deserialize_from_transfer(result)
@@ -234,6 +352,18 @@ class RemoteModule:
         wrapper.__name__ = func_name
         wrapper.__qualname__ = f"{self._module_name}.{func_name}"
         return wrapper
+
+    def register_trader_callback(self, event_name: str, callback):
+        """注册远端交易事件回调。
+
+        支持的事件: on_stock_asset, on_stock_order, on_stock_trade, on_stock_position
+        """
+        cb = self._get_trader_callback()
+        cb.register(event_name, callback)
+
+    def unregister_trader_callback(self, event_name: str, callback):
+        cb = self._get_trader_callback()
+        cb.unregister(event_name, callback)
     
     def _summarize_args(self, args, kwargs, max_len: int = 100) -> str:
         parts = []
@@ -293,11 +423,11 @@ class XtQuantRemote:
     - API调用日志
     
     使用示例:
-        xt = XtQuantRemote("192.168.1.100")
+        xt = XtQuantRemote("21.214.136.216")
         stocks = xt.xtdata.get_stock_list_in_sector("沪深A股")
         xt.close()
         
-        with XtQuantRemote("192.168.1.100") as xt:
+        with XtQuantRemote("21.214.136.216") as xt:
             df = xt.xtdata.get_market_data(["000001.SZ"])
     """
     
@@ -315,10 +445,19 @@ class XtQuantRemote:
         log_level="INFO",
         env_file=None,
     ):
-        # 加载环境变量文件（None 时自动查找 .env）
+        # 加载环境变量文件：显式指定 > 项目根目录 .env > 当前目录 .env
         try:
             from dotenv import load_dotenv
-            load_dotenv(env_file)
+            from pathlib import Path
+            if env_file:
+                load_dotenv(env_file)
+            else:
+                # client.py 位于 xqshare/client.py，项目根目录需要向上回退一级
+                project_env = Path(__file__).resolve().parents[2] / ".env"
+                if project_env.exists():
+                    load_dotenv(project_env)
+                else:
+                    load_dotenv()
         except ImportError:
             pass
 
@@ -351,11 +490,13 @@ class XtQuantRemote:
         self._stop_heartbeat = threading.Event()
         self._bg_thread = None  # BgServingThread for async callbacks
         self._account_level = None  # 账号等级
+        self._subscriptions = []  # 订阅列表，重连时恢复用
 
         self._xtdata = RemoteModule(self, 'xtdata')
         self._xttype = RemoteModule(self, 'xttype')
         self._xtconstant = RemoteModule(self, 'xtconstant')
         self._xtview = RemoteModule(self, 'xtview')
+        self._datadir = RemoteModule(self, 'datadir')
         self._logger = get_logger()
 
         self._connect()
@@ -393,19 +534,14 @@ class XtQuantRemote:
         ssl_context = self._create_ssl_context()
         
         try:
-            # 尝试新版本 rpyc API
-            try:
-                self._conn = rpyc.connect(self._host, self._port, config=config, ssl_context=ssl_context)
-            except TypeError:
-                # 旧版本 rpyc 不支持 ssl_context 参数
-                if ssl_context and self._use_ssl:
-                    # 使用 SSL 包装 socket
-                    import socket
-                    sock = socket.create_connection((self._host, self._port))
-                    sock = ssl_context.wrap_socket(sock, server_hostname=self._host)
-                    self._conn = rpyc.connect_stream(sock, config=config)
-                else:
-                    self._conn = rpyc.connect(self._host, self._port, config=config)
+            if ssl_context and self._use_ssl:
+                # rpyc 6.x connect() 不直接支持 ssl 参数，需要手动包装 socket
+                import socket
+                sock = socket.create_connection((self._host, self._port))
+                sock = ssl_context.wrap_socket(sock, server_hostname=self._host)
+                self._conn = rpyc.connect_stream(sock, config=config)
+            else:
+                self._conn = rpyc.connect(self._host, self._port, config=config)
             
             self._connected = True
 
@@ -463,6 +599,13 @@ class XtQuantRemote:
                     self._connected = False
                     self._token = None
                     self._connect()
+                    
+                    # 重连后重置所有 RemoteModule 的内部缓存，下次调用时自动重新获取远程对象
+                    self._xtdata._module = None
+                    self._xttype._module = None
+                    self._xtconstant._module = None
+                    self._xtview._module = None
+                    self._datadir._module = None
                     
                     for sub in self._subscriptions:
                         if sub._active:
@@ -530,9 +673,21 @@ class XtQuantRemote:
     def xtview(self):
         return self._xtview
 
+    @property
+    def datadir(self):
+        """QMT datadir 文件解析能力代理。
+
+        通过 RPyC 远程调用 Windows 端的 QmtDataReader，
+        接口风格与 xtdata 完全一致。
+
+        Raises:
+            RuntimeError: 当 server 端未配置 QMT_DATADIR_PATH 时抛出
+        """
+        return self._datadir
+
     def create_trader(self, userdata_path: str = None, session_id: int = None):
         """
-        创建交易实例
+        创建交易实例（不自动连接，需自行调用 start/connect）
 
         Args:
             userdata_path: QMT 客户端 userdata_mini 目录路径
@@ -555,6 +710,27 @@ class XtQuantRemote:
         # 用 RemoteModule 包装，添加日志和反序列化支持
         return RemoteModule(self, 'xttrader', trader)
 
+    def create_trader_and_connect(self, userdata_path: str = None, session_id: int = None, connect_timeout: float = 10.0):
+        """
+        创建交易实例并等待真实交易连接建立
+
+        与 create_trader 不同，此方法会在服务端主动调用 start() 和 connect()，
+        并等待 on_connected 回调确认连接建立后再返回。返回的 trader 已经处于
+        可下单状态。
+
+        Args:
+            userdata_path: QMT 客户端 userdata_mini 目录路径
+                          （可选，默认从环境变量 QMT_USERDATA_PATH 读取）
+            session_id: 会话ID（可选，默认自动生成时间戳）
+            connect_timeout: 等待连接建立的最大时间（秒）
+
+        Returns:
+            已建立连接的 XtQuantTrader 实例
+        """
+        self._ensure_connected()
+        trader = self._conn.root.create_trader_and_connect(userdata_path, session_id, connect_timeout)
+        return RemoteModule(self, 'xttrader', trader)
+
     def get_all_stocks(self):
         self._ensure_connected()
         return self._conn.root.get_all_stocks()
@@ -572,6 +748,24 @@ class XtQuantRemote:
         """
         self._ensure_connected()
         return self._conn.root.download_history_data2(stock_list, period, start_time, end_time, incrementally)
+
+    def download_sector_data(self, detail: bool = False):
+        """
+        下载行业板块数据，并返回下载状态反馈。
+
+        Args:
+            detail: 为 True 时返回完整的 sectors 列表，否则只返回统计摘要。
+
+        返回: dict
+            success: bool
+            native_result: xtdata.download_sector_data 的原生返回值（一般为 None）
+            elapsed_seconds: 下载耗时（秒）
+            datadir: 数据目录
+            before / after: 下载前后的扫描统计（detail=True 时包含完整 sectors 列表）
+            changes: 新增/删除的分类、板块数变化、字节数变化等
+        """
+        self._ensure_connected()
+        return self._conn.root.download_sector_data(detail=detail)
 
     def is_connected(self):
         return self._connected
@@ -658,3 +852,4 @@ xtdata = _ModuleProxy('xtdata')
 xttrader = _ModuleProxy('xttrader')
 xttype = _ModuleProxy('xttype')
 xtview = _ModuleProxy('xtview')
+datadir = _ModuleProxy('datadir')

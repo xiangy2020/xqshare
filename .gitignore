@@ -75,3 +75,4 @@ secrets/
 *.key
 *.pem
 .env.local
+clients.yaml

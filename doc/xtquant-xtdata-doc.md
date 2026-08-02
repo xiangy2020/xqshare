@@ -46,7 +46,7 @@
 client = xtdata.connect()
 
 # 连接远程服务
-client = xtdata.connect('192.168.1.100', 58610)
+client = xtdata.connect('21.214.136.216', 58610)
 ```
 
 ---
@@ -460,16 +460,25 @@ print(sectors)  # ['沪深A股', '上证A股', '深证A股', ...]
 
 ---
 
-### get_sector_info(sector_name='')
+### get_index_weight(index_code)
 
-获取板块信息。
+获取指数权重。
 
 **参数:**
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| sector_name | str | '' | 板块名称，空则获取所有 |
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| index_code | str | 指数代码 |
 
-**返回:** pd.DataFrame - 包含 sector 和 category 列
+**返回:** dict - `{stock: weight}`
+
+```python
+weights = xtdata.get_index_weight('000300.SH')
+```
+
+**命令行:**
+```bash
+xtdata get_index_weight --index-code "000300.SH"
+```
 
 ---
 
@@ -495,42 +504,6 @@ stocks = xtdata.get_stock_list_in_sector('沪深A股', '20230101')
 
 ---
 
-### get_index_weight(index_code)
-
-获取指数权重。
-
-**参数:**
-| 参数 | 类型 | 说明 |
-|------|------|------|
-| index_code | str | 指数代码 |
-
-**返回:** dict - `{stock: weight}`
-
-```python
-weights = xtdata.get_index_weight('000300.SH')
-```
-
----
-
-### create_sector_folder(parent_node, folder_name, overwrite=True)
-
-创建板块目录节点。
-
-**参数:**
-| 参数 | 类型 | 说明 |
-|------|------|------|
-| parent_node | str | 父节点，''为'我的'目录 |
-| folder_name | str | 目录名称 |
-| overwrite | bool | True跳过，False自动编号 |
-
----
-
-### create_sector(parent_node, sector_name, overwrite=True)
-
-创建板块。
-
----
-
 ### add_sector(sector_name, stock_list)
 
 增加自定义板块。
@@ -545,11 +518,10 @@ weights = xtdata.get_index_weight('000300.SH')
 xtdata.add_sector('我的自选', ['000001.SZ', '600000.SH'])
 ```
 
----
-
-### remove_stock_from_sector(sector_name, stock_list)
-
-从板块中移除股票。
+**命令行:**
+```bash
+xtdata add_sector --sector-name "我的自选" --stock-list "000001.SZ,600000.SH"
+```
 
 ---
 
@@ -557,11 +529,19 @@ xtdata.add_sector('我的自选', ['000001.SZ', '600000.SH'])
 
 删除自定义板块。
 
----
+**参数:**
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| sector_name | str | 板块名称 |
 
-### reset_sector(sector_name, stock_list)
+```python
+xtdata.remove_sector('我的自选')
+```
 
-重置板块成分股。
+**命令行:**
+```bash
+xtdata remove_sector --sector-name "我的自选"
+```
 
 ---
 
@@ -703,6 +683,12 @@ dates = xtdata.get_trading_dates('SH', '20240101', '20240131')
 | end_time | str | 结束时间 |
 
 **返回:** list[str] - 日期字符串列表
+
+**命令行示例：**
+```bash
+xtdata get_trading_calendar --market SH
+xtdata get_trading_calendar --market SZ --start-time "20260101" --end-time "20261231"
+```
 
 ---
 
@@ -847,6 +833,15 @@ def on_progress(data):
 ### download_index_weight()
 
 下载指数权重数据。
+
+```python
+xtdata.download_index_weight()
+```
+
+**命令行:**
+```bash
+xtdata download_index_weight
+```
 
 ---
 

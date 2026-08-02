@@ -50,6 +50,13 @@ API_PERMISSIONS: Dict[str, Permission] = {
     "xtdata.get_instrument_detail": Permission.BASIC,
     "xtdata.get_divid_factors": Permission.BASIC,
     "xtdata.get_sector_list": Permission.BASIC,
+    "xtdata.get_trading_calendar": Permission.BASIC,
+    "xtdata.get_holidays": Permission.BASIC,
+    "xtdata.get_ipo_info": Permission.BASIC,
+    "xtdata.get_index_weight": Permission.BASIC,
+    # 板块管理（基于服务端实际存在的 xtdata API）
+    "xtdata.add_sector": Permission.BASIC,
+    "xtdata.remove_sector": Permission.BASIC,
     "get_all_stocks": Permission.BASIC,
     "get_index_list": Permission.BASIC,
 
@@ -62,6 +69,8 @@ API_PERMISSIONS: Dict[str, Permission] = {
     "xtdata.download_history_data": Permission.DAILY,
     "xtdata.download_history_data2": Permission.DAILY,
     "download_history_data2": Permission.DAILY,
+    "xtdata.download_sector_data": Permission.DAILY,
+    "xtdata.download_index_weight": Permission.DAILY,
 
     # ==================== minute 权限 ====================
     "xtdata.get_financial_data": Permission.MINUTE,
@@ -75,6 +84,7 @@ API_PERMISSIONS: Dict[str, Permission] = {
     # ==================== trade 权限 ====================
     # 精确匹配：查询方法需要 TRADE_QUERY
     "create_trader": Permission.TRADE_QUERY,
+    "create_trader_and_connect": Permission.TRADE_QUERY,
     "create_xttrader": Permission.TRADE_QUERY,
     # 生命周期方法
     "xttrader.start": Permission.TRADE_QUERY,
@@ -190,10 +200,16 @@ class PermissionChecker:
 
     def _load_config(self) -> None:
         """加载配置文件"""
+        import logging
+
         config_file = Path(self.config_path)
 
         if not config_file.exists():
             # 配置文件不存在，使用默认客户端
+            logging.warning(
+                f"[配置加载] 未找到配置文件: {self.config_path}，将启用默认客户端。"
+                f"如需自定义认证，请在启动目录下创建 clients.yaml（可参考 clients.yaml.example）。"
+            )
             self._create_default_client()
             return
 
@@ -204,21 +220,34 @@ class PermissionChecker:
             with open(config_file, "r", encoding="utf-8") as f:
                 data = yaml.safe_load(f)
 
-            if data and "clients" in data:
+            if not isinstance(data, dict):
+                logging.warning(
+                    f"[配置加载] {self.config_path} 内容格式异常（顶层不是字典），"
+                    f"可能使用了旧版示例文件。将启用默认客户端。"
+                )
+                self._create_default_client()
+                return
+
+            if "clients" in data and isinstance(data["clients"], dict):
                 for client_id, client_data in data["clients"].items():
                     if isinstance(client_data, dict):
                         self._clients[client_id] = ClientConfig.from_dict(client_data)
 
             # 如果配置为空，使用默认客户端
             if not self._clients:
+                logging.warning(
+                    f"[配置加载] {self.config_path} 中未找到有效账号条目，将启用默认客户端。"
+                )
                 self._create_default_client()
             else:
-                import logging
-                logging.info(f"[配置加载] 有效账号数量: {len(self._clients)}")
+                logging.info(f"[配置加载] 成功加载 {len(self._clients)} 个账号: {list(self._clients.keys())}")
         except Exception as e:
             # 配置加载失败，使用默认客户端
-            import logging
-            logging.warning(f"加载客户端配置失败: {e}，使用默认客户端")
+            logging.warning(
+                f"[配置加载] {self.config_path} 解析失败: {e}，将启用默认客户端。"
+                f"常见原因：YAML 语法错误、文件编码不是 UTF-8、或使用了不兼容的旧版示例文件。"
+                f"请参考安装包中的 clients.yaml.example 重新配置。"
+            )
             self._create_default_client()
 
     def _create_default_client(self) -> None:
@@ -226,10 +255,11 @@ class PermissionChecker:
         self._use_default_client = True
         self._clients[DEFAULT_CLIENT_ID] = ClientConfig(
             secret=DEFAULT_CLIENT_SECRET,
-            level=AccountLevel.STANDARD
+            level=AccountLevel.ENTERPRISE
         )
         import logging
-        logging.warning(f"[配置加载] 未找到 clients.yaml，启用默认账号: {DEFAULT_CLIENT_ID} (level=standard)")
+        logging.warning(f"[配置加载] 未找到有效的 clients.yaml，已启用默认账号: {DEFAULT_CLIENT_ID} (level=enterprise)。")
+        logging.warning(f"[配置加载] 如需自定义客户端，请编辑当前目录下的 clients.yaml（可参考 clients.yaml.example 模板）")
 
     def check_and_reload_if_changed(self) -> bool:
         """
