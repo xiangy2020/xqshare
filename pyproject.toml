@@ -36,7 +36,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Office/Business :: Financial :: Investment",
     "Topic :: Software Development :: Libraries :: Python Modules",
-    "Topic :: System :: Networking :: Topic :: Office/Business :: Financial :: Investment",
+    "Topic :: System :: Networking",
 ]
 dependencies = [
     "rpyc>=6.0",
