@@ -76,3 +76,6 @@ secrets/
 *.pem
 .env.local
 clients.yaml
+
+# Tool-internal working dirs
+.workbuddy/
