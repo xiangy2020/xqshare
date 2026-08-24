@@ -1955,13 +1955,15 @@ def _cmd_background(args):
     log_file = _get_log_file()
 
     # 构建启动命令（透传所有参数）
-    # Windows 上后台子进程用 pythonw.exe，避免弹出控制台窗口
+    # Windows 上后台子进程必须用 python.exe（非 pythonw.exe）：pythonw 无控制台，
+    # 其 stdout 重定向到文件时会丢失输出（日志文件始终为空）。改用 python.exe
+    # + -u（无缓冲，print 实时落盘），DETACHED_PROCESS 仍保留以脱离启动控制台。
     if sys.platform == "win32":
-        pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
-        bg_executable = pythonw if os.path.exists(pythonw) else sys.executable
+        bg_executable = sys.executable
+        cmd = [bg_executable, "-u", "-m", "xqshare.server", "fg"]
     else:
         bg_executable = sys.executable
-    cmd = [bg_executable, "-m", "xqshare.server", "fg"]
+        cmd = [bg_executable, "-m", "xqshare.server", "fg"]
     if args.host != "0.0.0.0":
         cmd += ["--host", args.host]
     if args.port:
