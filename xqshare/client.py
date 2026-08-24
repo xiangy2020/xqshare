@@ -250,7 +250,7 @@ class RemoteTraderCallback:
                     try:
                         cb(event_name, account_id, payload)
                     except Exception as e:
-                        logger.warning(f"[RemoteTraderCallback] 用户回调异常: {event_name} {e}")
+                        get_logger().warning(f"[RemoteTraderCallback] 用户回调异常: {event_name} {e}")
 
     def register(self, event_name: str, callback):
         if event_name not in self.SUPPORTED_EVENTS:
@@ -269,6 +269,77 @@ class RemoteTraderCallback:
         self._running = False
 
 
+# ==================== Quote 远程行情回调接收器 ====================
+
+# 各订阅接口的 callback 参数位置（0-based），用于 _wrap_call 注入接收器
+_QUOTE_SUBSCRIBE_CALLBACK_POS = {
+    'subscribe_whole_quote': 1,
+    'subscribe_quote': 5,
+    'subscribe_quote2': 6,
+}
+
+
+class RemoteQuoteCallback:
+    """客户端接收服务端推送的行情 tick 并分发给用户回调。
+
+    通过 RPyC 反向通道暴露 exposed_on_quote_event，服务端在 tick 到来时
+    调用。服务端把 tick 数据 JSON 序列化成字符串按值传输，客户端收到后
+    还原成本地 dict 再分发，避免 netref 逐元素 RPC 死锁。
+    """
+
+    def __init__(self, module: "RemoteModule"):
+        self._module = module
+        self._lock = threading.Lock()
+        self._callbacks = []
+        self._running = True
+        self._queue = []
+        self._queue_lock = threading.Lock()
+        self._event_thread = threading.Thread(target=self._dispatch_loop, daemon=True)
+        self._event_thread.start()
+
+    def exposed_on_quote_event(self, payload):
+        """服务端反向调用入口。payload 为 JSON 字符串（按值传输）。"""
+        if isinstance(payload, (str, bytes)):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                pass
+        with self._queue_lock:
+            self._queue.append(payload)
+
+    def _dispatch_loop(self):
+        while self._running:
+            batch = []
+            with self._queue_lock:
+                if self._queue:
+                    batch = self._queue
+                    self._queue = []
+            if not batch:
+                time.sleep(0.01)
+                continue
+            for payload in batch:
+                with self._lock:
+                    callbacks = list(self._callbacks)
+                for cb in callbacks:
+                    try:
+                        cb(payload)
+                    except Exception as e:
+                        get_logger().warning(f"[RemoteQuoteCallback] 用户回调异常: {e}")
+
+    def register(self, callback):
+        with self._lock:
+            if callback not in self._callbacks:
+                self._callbacks.append(callback)
+
+    def unregister(self, callback):
+        with self._lock:
+            if callback in self._callbacks:
+                self._callbacks.remove(callback)
+
+    def stop(self):
+        self._running = False
+
+
 # ==================== 远程模块代理 ====================
 
 class RemoteModule:
@@ -280,6 +351,7 @@ class RemoteModule:
         self._module = module  # 支持直接传入对象
         self._logger = get_logger()
         self._trader_callback = None  # 仅 xttrader 模块使用
+        self._quote_callback = None   # 仅 xtdata 模块使用
 
     def _ensure_module(self):
         if self._module is None:
@@ -297,6 +369,12 @@ class RemoteModule:
         if self._module_name == 'xttrader' and self._trader_callback is None:
             self._trader_callback = RemoteTraderCallback(self)
         return self._trader_callback
+
+    def _get_quote_callback(self):
+        """懒初始化 quote 远程行情回调接收器"""
+        if self._module_name == 'xtdata' and self._quote_callback is None:
+            self._quote_callback = RemoteQuoteCallback(self)
+        return self._quote_callback
 
     def __getattr__(self, name):
         module = self._ensure_module()
@@ -336,6 +414,25 @@ class RemoteModule:
                         cb = self._get_trader_callback()
                         kwargs.setdefault('callback', cb)
 
+                # xtdata 行情订阅自动挂载远端回调接收器，用户 callback 注册到接收器
+                if self._module_name == 'xtdata':
+                    pos = _QUOTE_SUBSCRIBE_CALLBACK_POS.get(func_name)
+                    if pos is not None:
+                        cb = self._get_quote_callback()
+                        if 'callback' in kwargs:
+                            user_cb = kwargs.get('callback')
+                            if user_cb is not None:
+                                cb.register(user_cb)
+                            kwargs['callback'] = cb
+                        elif len(args) > pos:
+                            args = list(args)
+                            if args[pos] is not None:
+                                cb.register(args[pos])
+                            args[pos] = cb
+                            args = tuple(args)
+                        else:
+                            kwargs['callback'] = cb
+
                 result = func(*args, **kwargs)
                 # 反序列化服务端优化传输的数据
                 result = _deserialize_from_transfer(result)
@@ -364,6 +461,20 @@ class RemoteModule:
     def unregister_trader_callback(self, event_name: str, callback):
         cb = self._get_trader_callback()
         cb.unregister(event_name, callback)
+
+    def register_quote_callback(self, callback):
+        """注册远端行情 tick 回调。
+
+        订阅行情（subscribe_whole_quote / subscribe_quote）后，tick 数据由
+        服务端序列化推送，客户端还原为本地 dict 后调用本回调：
+            callback(data)，data = {stock_code: tick_dict}
+        """
+        cb = self._get_quote_callback()
+        cb.register(callback)
+
+    def unregister_quote_callback(self, callback):
+        cb = self._get_quote_callback()
+        cb.unregister(callback)
     
     def _summarize_args(self, args, kwargs, max_len: int = 100) -> str:
         parts = []
@@ -836,6 +947,23 @@ def disconnect():
 def get_client():
     """获取全局客户端"""
     return _global_client
+
+
+def register_quote_callback(callback):
+    """注册全局连接的行情 tick 回调（模块级便捷函数）。
+
+    等价于 get_client().xtdata.register_quote_callback(callback)。
+    """
+    if _global_client is None:
+        raise RuntimeError("请先调用 connect() 建立连接")
+    return _global_client.xtdata.register_quote_callback(callback)
+
+
+def unregister_quote_callback(callback):
+    """注销全局连接的行情 tick 回调（模块级便捷函数）。"""
+    if _global_client is None:
+        raise RuntimeError("请先调用 connect() 建立连接")
+    return _global_client.xtdata.unregister_quote_callback(callback)
 
 
 class _ModuleProxy:

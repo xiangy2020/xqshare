@@ -533,6 +533,96 @@ class _TraderConnectionCallback(_TraderEventCallback):
         return self._connected_event.wait(timeout)
 
 
+# ==================== Quote 行情事件回调透传 ====================
+
+class _QuoteEventCallback:
+    """服务端收集 xtquant 行情 tick 并路由给远端客户端。
+
+    xtdata 是模块级单例，所有客户端共享同一份订阅，因此本路由器为
+    XtQuantService 类级单例（区别于 per-trader 的 _TraderEventCallback）。
+
+    xtquant 的原生 subscribe_whole_quote / subscribe_quote 注册本对象作为
+    callback；tick 到来时把数据 JSON 序列化成字符串（str 在 RPyC 中按值
+    传输），再通过反向通道推送给已注册的客户端。这样客户端拿到的是值拷贝
+    而非 netref，避免在锁内遍历 netref dict 逐元素 RPC 导致死锁。
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        # key 用 id(netref)（本地内存地址）而非 netref 本身：
+        # set 的 add/discard 会对 netref 求 hash（触发 RPC），客户端断开后
+        # 该 RPC 会抛 EOFError，导致 dispatch 线程崩溃。id() 是纯本地操作。
+        self._subscribers = {}  # id(client_callback_netref) -> client_callback_netref
+        self._running = True
+        self._queue = []
+        self._queue_lock = threading.Lock()
+        self._event_thread = threading.Thread(target=self._dispatch_loop, daemon=True)
+        self._event_thread.start()
+
+    def __call__(self, data):
+        """使路由器可被 xtquant 作为函数式 callback 调用。
+
+        xtquant 的 subscribe_whole_quote / subscribe_quote 通过
+        subscribe_callback_wrapper 包装后以 `callback(datas)` 形式调用，
+        因此需要 __call__（区别于 xttrader 的具名方法回调）。
+        """
+        self.on_data(data)
+
+    def on_data(self, data):
+        """xtquant tick 回调入口。data = {stock_code: tick_dict}"""
+        if not data:
+            return
+        try:
+            payload = json.dumps(_serialize_object(data), ensure_ascii=False, default=str)
+        except Exception as e:
+            logger.warning(f"[QuoteEvent] tick 序列化失败: {e}")
+            return
+        with self._queue_lock:
+            self._queue.append(payload)
+        logger.debug(f"[QuoteEvent] tick 入队 queue_len={len(self._queue)}")
+
+    def _dispatch_loop(self):
+        while self._running:
+            batch = []
+            with self._queue_lock:
+                if self._queue:
+                    batch = self._queue
+                    self._queue = []
+            if not batch:
+                time.sleep(0.01)
+                continue
+            for payload in batch:
+                with self._lock:
+                    callbacks = list(self._subscribers.values())
+                for cb in callbacks:
+                    try:
+                        cb.exposed_on_quote_event(payload)
+                    except Exception as e:
+                        # 客户端断开后 netref 调用会失败，自动移除失效订阅者
+                        logger.warning(f"[QuoteEvent] 推送到客户端失败，自动移除: {e}")
+                        self.unregister(cb)
+
+    def register(self, client_callback):
+        with self._lock:
+            self._subscribers[id(client_callback)] = client_callback
+        logger.info(f"[QuoteEvent] 注册订阅者 total={len(self._subscribers)}")
+
+    def unregister(self, client_callback):
+        with self._lock:
+            self._subscribers.pop(id(client_callback), None)
+
+    def stop(self):
+        self._running = False
+
+
+# 各订阅接口的 callback 参数位置（0-based），用于 LoggingProxy 拦截时提取客户端回调
+_QUOTE_SUBSCRIBE_CALLBACK_POS = {
+    'subscribe_whole_quote': 1,
+    'subscribe_quote': 5,
+    'subscribe_quote2': 6,
+}
+
+
 # ==================== Trader 连接断开处理 ====================
 
 class LoggingProxy:
@@ -543,7 +633,7 @@ class LoggingProxy:
     自动落到服务端自定义封装版本，而不是直接透传给底层 xtquant。
     """
 
-    def __init__(self, target, target_name: str, client_info_getter, permission_checker=None, account_level=None, service_instance=None, event_callback=None):
+    def __init__(self, target, target_name: str, client_info_getter, permission_checker=None, account_level=None, service_instance=None, event_callback=None, quote_event_callback=None):
         object.__setattr__(self, '_target', target)
         object.__setattr__(self, '_target_name', target_name)
         object.__setattr__(self, '_get_client_info', client_info_getter)
@@ -551,6 +641,7 @@ class LoggingProxy:
         object.__setattr__(self, '_account_level', account_level)
         object.__setattr__(self, '_service_instance', service_instance)
         object.__setattr__(self, '_event_callback', event_callback)
+        object.__setattr__(self, '_quote_event_callback', quote_event_callback)
 
     def __getattr__(self, name):
         target = object.__getattribute__(self, '_target')
@@ -560,6 +651,7 @@ class LoggingProxy:
         account_level = object.__getattribute__(self, '_account_level')
         service_instance = object.__getattribute__(self, '_service_instance')
         event_callback = object.__getattribute__(self, '_event_callback')
+        quote_event_callback = object.__getattribute__(self, '_quote_event_callback')
 
         # 优先使用服务端暴露的封装方法（如果存在）
         if service_instance is not None:
@@ -606,6 +698,26 @@ class LoggingProxy:
                             account_id = getattr(account, 'account_id', str(account))
                             event_callback.unregister(account_id, client_callback)
                         return attr(*args, **kwargs)
+
+                # 对 xtdata 的行情订阅做特殊处理，拦截回调并统一路由到服务端事件路由器，
+                # 避免客户端本地 callback 以 netref 反向引用传递导致锁内 RPC 死锁。
+                if target_name == 'xtdata' and quote_event_callback is not None:
+                    if name in _QUOTE_SUBSCRIBE_CALLBACK_POS:
+                        pos = _QUOTE_SUBSCRIBE_CALLBACK_POS[name]
+                        client_callback = kwargs.pop('callback', None)
+                        if client_callback is not None:
+                            # 客户端传了接收器（netref），注册到路由器
+                            quote_event_callback.register(client_callback)
+                            kwargs['callback'] = quote_event_callback
+                        elif len(args) > pos:
+                            args = list(args)
+                            if args[pos] is not None:
+                                quote_event_callback.register(args[pos])
+                            args[pos] = quote_event_callback
+                            args = tuple(args)
+                        else:
+                            # 未传回调：仍用服务端路由器接管（此时无订阅者，数据被丢弃）
+                            kwargs['callback'] = quote_event_callback
 
                 result = _log_call(full_name, get_client_info(), attr, *args, **kwargs)
 
@@ -664,6 +776,14 @@ class XtQuantService(rpyc.Service):
     _datadir_reader = None      # QmtDataReader 单例（server 级）
     _datadir_path = None        # datadir 路径（用于错误提示）
     _datadir_error = None       # 初始化错误信息（路径不存在等）
+    _quote_event_callback = None  # 行情事件路由器单例（server 级，xtdata 共享）
+
+    @classmethod
+    def _get_quote_event_callback(cls):
+        """懒初始化行情事件路由器单例（xtdata 为模块级单例，所有客户端共享）。"""
+        if cls._quote_event_callback is None:
+            cls._quote_event_callback = _QuoteEventCallback()
+        return cls._quote_event_callback
 
     def on_connect(self, conn):
         self._conn = conn
@@ -763,7 +883,8 @@ class XtQuantService(rpyc.Service):
             lambda: self._client_info,
             XtQuantService._permission_checker,
             self._account_level,
-            service_instance=self
+            service_instance=self,
+            quote_event_callback=XtQuantService._get_quote_event_callback()
         )
 
     @log_api_call("get_xttype")

@@ -18,6 +18,7 @@
   - [2.2 `disconnect()`](#22-disconnect)
   - [2.3 `get_client()`](#23-get_client)
   - [2.4 全局模块代理对象](#24-全局模块代理对象)
+  - [2.5 行情回调注册](#25-行情回调注册)
 - [3. datadir 模块 API](#3-datadir-模块-api)
   - [3.1 `datadir.kline()`](#31-datadirkline)
   - [3.2 `datadir.sector_categories()`](#32-datadirsector_categories)
@@ -523,6 +524,61 @@ import xqshare
 xqshare.xtdata.get_stock_list_in_sector("沪深A股")
 # RuntimeError: 请先调用 connect() 建立连接
 ```
+
+### 2.5 行情回调注册
+
+xqshare 支持行情 tick 回调：server 端拦截 `xtdata.subscribe_whole_quote` / `subscribe_quote` 的 callback，把 tick 数据 JSON 序列化后经反向通道推送给客户端，客户端还原为**本地 dict** 后调用用户注册的回调。回调参数为 `data = {stock_code: tick_dict}`。
+
+**关键约定：** 订阅行情时**不要**在 `subscribe_whole_quote` / `subscribe_quote` 里传本地 `callback=`（本地 callback 会以 RPyC netref 反向引用传递，导致客户端在锁内遍历 netref dict 时逐元素 RPC 而死锁）。回调统一通过 `register_quote_callback` 注册。
+
+#### 通过模块代理注册
+
+```python
+from xqshare import XtQuantRemote
+
+with XtQuantRemote("21.214.136.216", client_secret="xxx") as xt:
+    def on_tick(data):
+        # data = {"000001.SZ": {"lastPrice": ..., "lastClose": ...}}
+        for code, tick in data.items():
+            print(code, tick.get("lastPrice"))
+
+    # 1. 注册行情回调
+    xt.xtdata.register_quote_callback(on_tick)
+
+    # 2. 订阅全推行情（不传 callback，客户端自动接管）
+    seq = xt.xtdata.subscribe_whole_quote(["000001.SZ", "600000.SH"])
+```
+
+#### 通过全局便捷函数注册
+
+```python
+import xqshare
+
+xqshare.connect(host="21.214.136.216", client_secret="xxx")
+
+def on_tick(data):
+    print(data)
+
+# 等价于 xqshare.xtdata.register_quote_callback(on_tick)
+xqshare.client.register_quote_callback(on_tick)
+
+xqshare.xtdata.subscribe_whole_quote(["000001.SZ"])
+```
+
+**注销：**
+
+```python
+xt.xtdata.unregister_quote_callback(on_tick)
+# 或 xqshare.client.unregister_quote_callback(on_tick)
+```
+
+**回调签名：**
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `data` | `dict` | `{stock_code: tick_dict}`，`tick_dict` 含 `lastPrice` / `lastClose` / `open` / `high` / `low` / `volume` / `amount` / `time` 等字段 |
+
+> **说明：** `data` 为客户端本地 dict（服务端已 JSON 序列化、客户端已反序列化），遍历 `data.items()` 是纯本地操作，无 RPC 往返，可在任意锁内安全使用。
 
 ---
 
