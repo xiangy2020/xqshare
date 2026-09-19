@@ -57,6 +57,17 @@ except ImportError:
     QmtDataReader = None
     QMTDATAREADER_AVAILABLE = False
 
+# 通道抽象层导入（大QMT ↔ miniQMT 无感切换）
+try:
+    from xqshare.channels.router import ChannelRouter
+    from xqshare.channels.bigqmt import BigQmtChannel, BigQmtCallbackAdapter
+    CHANNELS_AVAILABLE = True
+except ImportError:
+    ChannelRouter = None
+    BigQmtChannel = None
+    BigQmtCallbackAdapter = None
+    CHANNELS_AVAILABLE = False
+
 
 # ==================== 日志配置 ====================
 
@@ -623,6 +634,67 @@ _QUOTE_SUBSCRIBE_CALLBACK_POS = {
 }
 
 
+# ==================== download 类调用超时隔离 ====================
+
+# 需要超时/线程隔离的 download 类方法名（盘后券商挂起会永久阻塞 worker 线程）
+DOWNLOAD_METHODS = {
+    'download_sector_data', 'download_history_data', 'download_history_data2',
+    'download_financial_data', 'download_metatable_data', 'download_holiday_data',
+}
+
+
+def _get_download_timeout() -> int:
+    """读取 download 超时阈值（秒），默认 600，可用 env XQSHARE_DOWNLOAD_TIMEOUT 覆盖。"""
+    raw = os.environ.get("XQSHARE_DOWNLOAD_TIMEOUT", "600")
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 600
+
+
+DOWNLOAD_TIMEOUT_SECONDS = _get_download_timeout()
+
+
+def _call_download_with_timeout(fn, *args, timeout=None, name=None, **kwargs):
+    """在独立 daemon 线程执行下载，主线程带超时等待。
+
+    背景：xtquant 的 download_* 是 C 扩展调用，盘后券商不响应时会永久挂起，
+    同步透传会把 xqshare worker 线程一起堵死，连带后续所有下载请求失败。
+
+    超时后抛 TimeoutError 释放 rpyc 响应；底层 daemon 线程无法被 Python 强制
+    中断，会残留挂起，直到 QMT/xqshare 进程重启才回收（不阻塞后续新请求）。
+
+    Args:
+        fn: 要执行的下载函数。
+        timeout: 超时秒数，默认 DOWNLOAD_TIMEOUT_SECONDS。
+        name: 方法名，用于线程名和超时报错信息（缺省取 fn.__name__）。
+    """
+    if timeout is None:
+        timeout = DOWNLOAD_TIMEOUT_SECONDS
+
+    holder = {}
+
+    def _worker():
+        try:
+            holder['result'] = fn(*args, **kwargs)
+        except Exception as e:
+            holder['error'] = e
+
+    thread_name = name or getattr(fn, '__name__', 'download')
+    t = threading.Thread(target=_worker, daemon=True, name=f"xq-download-{thread_name}")
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        api_logger.warning(
+            f"[TIMEOUT] {thread_name} 超过 {timeout}s，底层 QMT 调用仍在挂起"
+            f"（daemon 线程残留，进程重启后回收）"
+        )
+        raise TimeoutError(f"{thread_name} 超时（{timeout}s），底层 QMT 调用仍在挂起")
+    if 'error' in holder:
+        raise holder['error']
+    return holder.get('result')
+
+
 # ==================== Trader 连接断开处理 ====================
 
 class LoggingProxy:
@@ -633,7 +705,7 @@ class LoggingProxy:
     自动落到服务端自定义封装版本，而不是直接透传给底层 xtquant。
     """
 
-    def __init__(self, target, target_name: str, client_info_getter, permission_checker=None, account_level=None, service_instance=None, event_callback=None, quote_event_callback=None):
+    def __init__(self, target, target_name: str, client_info_getter, permission_checker=None, account_level=None, service_instance=None, event_callback=None, quote_event_callback=None, target_resolver=None):
         object.__setattr__(self, '_target', target)
         object.__setattr__(self, '_target_name', target_name)
         object.__setattr__(self, '_get_client_info', client_info_getter)
@@ -642,9 +714,19 @@ class LoggingProxy:
         object.__setattr__(self, '_service_instance', service_instance)
         object.__setattr__(self, '_event_callback', event_callback)
         object.__setattr__(self, '_quote_event_callback', quote_event_callback)
+        object.__setattr__(self, '_target_resolver', target_resolver)
 
     def __getattr__(self, name):
         target = object.__getattribute__(self, '_target')
+        # 通道级动态解析：每次属性访问从路由取当前活跃目标（mini ↔ bigqmt）
+        target_resolver = object.__getattribute__(self, '_target_resolver')
+        if target_resolver is not None:
+            resolved = target_resolver()
+            if resolved is None:
+                raise RuntimeError(
+                    "miniQMT 与大QMT 通道均不可用，当前接口无法调用"
+                )
+            target = resolved
         target_name = object.__getattribute__(self, '_target_name')
         get_client_info = object.__getattribute__(self, '_get_client_info')
         permission_checker = object.__getattribute__(self, '_permission_checker')
@@ -654,11 +736,13 @@ class LoggingProxy:
         quote_event_callback = object.__getattribute__(self, '_quote_event_callback')
 
         # 优先使用服务端暴露的封装方法（如果存在）
+        is_exposed = False
         if service_instance is not None:
             exposed_name = f"exposed_{name}"
             exposed_attr = getattr(service_instance, exposed_name, None)
             if exposed_attr is not None and callable(exposed_attr):
                 attr = exposed_attr
+                is_exposed = True
             else:
                 attr = getattr(target, name)
         else:
@@ -719,7 +803,16 @@ class LoggingProxy:
                             # 未传回调：仍用服务端路由器接管（此时无订阅者，数据被丢弃）
                             kwargs['callback'] = quote_event_callback
 
-                result = _log_call(full_name, get_client_info(), attr, *args, **kwargs)
+                # download 类调用统一加超时隔离：对直通底层 xtquant 的 download
+                # 方法（无 exposed_* 封装的）包进 _call_download_with_timeout，
+                # 避免盘后券商挂起堵死 worker 线程。
+                if target_name == 'xtdata' and name in DOWNLOAD_METHODS and not is_exposed:
+                    result = _call_download_with_timeout(
+                        _log_call, full_name, get_client_info(), attr, *args, **kwargs,
+                        name=name,
+                    )
+                else:
+                    result = _log_call(full_name, get_client_info(), attr, *args, **kwargs)
 
                 # 如果返回的是复杂对象（非基本类型），递归包装
                 if result is not None and hasattr(result, '__class__'):
@@ -777,6 +870,7 @@ class XtQuantService(rpyc.Service):
     _datadir_path = None        # datadir 路径（用于错误提示）
     _datadir_error = None       # 初始化错误信息（路径不存在等）
     _quote_event_callback = None  # 行情事件路由器单例（server 级，xtdata 共享）
+    _router = None              # 通道路由器单例（server 级）
 
     @classmethod
     def _get_quote_event_callback(cls):
@@ -784,6 +878,15 @@ class XtQuantService(rpyc.Service):
         if cls._quote_event_callback is None:
             cls._quote_event_callback = _QuoteEventCallback()
         return cls._quote_event_callback
+
+    @classmethod
+    def _get_router(cls):
+        """懒初始化通道路由器单例（大QMT ↔ miniQMT 无感切换）。"""
+        if cls._router is None:
+            if not CHANNELS_AVAILABLE:
+                raise RuntimeError("通道抽象层不可用（xqshare.channels 导入失败）")
+            cls._router = ChannelRouter.instance()
+        return cls._router
 
     def on_connect(self, conn):
         self._conn = conn
@@ -884,7 +987,8 @@ class XtQuantService(rpyc.Service):
             XtQuantService._permission_checker,
             self._account_level,
             service_instance=self,
-            quote_event_callback=XtQuantService._get_quote_event_callback()
+            quote_event_callback=XtQuantService._get_quote_event_callback(),
+            target_resolver=lambda: XtQuantService._get_router().data_target(),
         )
 
     @log_api_call("get_xttype")
@@ -895,6 +999,16 @@ class XtQuantService(rpyc.Service):
     def exposed_get_xtconstant(self):
         self._require_auth()
         return self._xtconstant
+
+    @log_api_call("get_xttrader")
+    def exposed_get_xttrader(self):
+        """获取 xtquant.xttrader 模块代理（XtQuantTrader 类等）。
+
+        与 get_xttype / get_xtconstant 一致，仅用于模块级访问。
+        创建交易实例请用 create_trader / create_trader_and_connect。
+        """
+        self._require_auth()
+        return self._xttrader
 
     @log_api_call("get_datadir")
     def exposed_get_datadir(self):
@@ -962,6 +1076,13 @@ class XtQuantService(rpyc.Service):
         if not XTQUANT_AVAILABLE:
             raise RuntimeError("xtquant 库未安装")
 
+        # 路由决定交易通道：mini 或 bigqmt
+        trader_mode = self._resolve_trader_mode()
+
+        if trader_mode == "bigqmt":
+            return self._create_bigqmt_trader(userdata_path, session_id)
+
+        # mini 通道（现状）
         # 从环境变量获取默认值
         if userdata_path is None:
             userdata_path = os.environ.get("QMT_USERDATA_PATH")
@@ -985,6 +1106,89 @@ class XtQuantService(rpyc.Service):
         trader.register_callback(event_callback)
 
         # 用 LoggingProxy 包装 trader，支持日志记录、序列化和事件回调透传
+        return LoggingProxy(
+            trader, 'xttrader',
+            lambda: self._client_info,
+            XtQuantService._permission_checker,
+            self._account_level,
+            event_callback=event_callback
+        )
+
+    def _resolve_trader_mode(self) -> str:
+        """按路由返回交易通道模式（'mini' | 'bigqmt'），路由不可用时回落 mini。"""
+        try:
+            return XtQuantService._get_router().trader_mode()
+        except Exception:
+            return "mini"
+
+    def _create_bigqmt_trader(self, userdata_path: str = None, session_id: int = None):
+        """创建大QMT 交易通道实例（复用 xtquant_big_convert，drop-in 替换 XtQuantTrader）。"""
+        if not CHANNELS_AVAILABLE or BigQmtChannel is None:
+            raise RuntimeError("大QMT 通道不可用（xqshare.channels 未安装或未启用）")
+
+        # 自动生成 session_id
+        if session_id is None:
+            session_id = int(time.time() * 1000) % 1000000
+
+        # BigQmtChannel.create_trader 返回带下单闸门的 _GuardedTrader
+        trader = BigQmtChannel.create_trader(userdata_path, session_id)
+
+        account_id = BigQmtChannel.account_id()
+        logger.info(f"[创建大QMT Trader] account_id={account_id} | session_id={session_id}")
+
+        # 每个 trader 独立一个事件路由器；用回调适配器把 bigqmt 回调转发过来
+        event_callback = _TraderEventCallback()
+        adapter = BigQmtCallbackAdapter(
+            event_callback, account_id=account_id, logger=logger
+        )
+        trader.register_callback(adapter)
+
+        # 记录 trader 实例，供 on_disconnect 时自动清理
+        self._traders.append(trader)
+
+        return LoggingProxy(
+            trader, 'xttrader',
+            lambda: self._client_info,
+            XtQuantService._permission_checker,
+            self._account_level,
+            event_callback=event_callback
+        )
+
+    def _create_bigqmt_trader_and_connect(
+        self, userdata_path: str = None, session_id: int = None,
+        connect_timeout: float = 10.0,
+    ):
+        """创建大QMT 交易通道并连接（bigqmt connect 同步，无 on_connected 等待）。"""
+        if not CHANNELS_AVAILABLE or BigQmtChannel is None:
+            raise RuntimeError("大QMT 通道不可用（xqshare.channels 未安装或未启用）")
+
+        if session_id is None:
+            session_id = int(time.time() * 1000) % 1000000
+
+        trader = BigQmtChannel.create_trader(userdata_path, session_id)
+
+        account_id = BigQmtChannel.account_id()
+        event_callback = _TraderEventCallback()
+        adapter = BigQmtCallbackAdapter(
+            event_callback, account_id=account_id, logger=logger
+        )
+        trader.register_callback(adapter)
+
+        logger.info(f"[创建并连接大QMT Trader] account_id={account_id} | session_id={session_id}")
+
+        start_result = trader.start()
+        logger.info(f"[大QMT Trader] start() 返回: {start_result}")
+        if start_result not in (0, None):
+            raise RuntimeError(f"启动大QMT 交易线程失败，错误码: {start_result}")
+
+        # bigqmt connect() 同步：内部 RPC ping + 合成 on_account_status；失败抛异常
+        connect_result = trader.connect()
+        logger.info(f"[大QMT Trader] connect() 返回: {connect_result}")
+        if connect_result not in (0, None):
+            raise ConnectionError(f"大QMT 连接失败: 错误码 {connect_result}")
+
+        self._traders.append(trader)
+
         return LoggingProxy(
             trader, 'xttrader',
             lambda: self._client_info,
@@ -1024,6 +1228,10 @@ class XtQuantService(rpyc.Service):
                 raise error
         if not XTQUANT_AVAILABLE:
             raise RuntimeError("xtquant 库未安装")
+
+        # 路由决定交易通道：bigqmt 走同步 connect（无 on_connected 等待）
+        if self._resolve_trader_mode() == "bigqmt":
+            return self._create_bigqmt_trader_and_connect(userdata_path, session_id, connect_timeout)
 
         if userdata_path is None:
             userdata_path = os.environ.get("QMT_USERDATA_PATH")
@@ -1217,7 +1425,9 @@ class XtQuantService(rpyc.Service):
 
         start = time.time()
         try:
-            result = self._xtdata.download_sector_data()
+            result = _call_download_with_timeout(
+                self._xtdata.download_sector_data, name="download_sector_data"
+            )
         except Exception as e:
             return {
                 "success": False,
@@ -1306,8 +1516,11 @@ class XtQuantService(rpyc.Service):
             # C 扩展拿不到签名（极少见），按新版本处理
             kwargs["incrementally"] = inc
 
-        self._xtdata.download_history_data2(
-            stock_list, period, start_time, end_time, **kwargs
+        _call_download_with_timeout(
+            self._xtdata.download_history_data2,
+            stock_list, period, start_time, end_time,
+            name="download_history_data2",
+            **kwargs
         )
 
         return status
@@ -1321,6 +1534,22 @@ class XtQuantService(rpyc.Service):
             "uptime": time.time() - getattr(self, '_start_time', time.time()),
             "client_id": self._client_id,
         }
+
+    @log_api_call("get_channel_status")
+    def exposed_get_channel_status(self):
+        """返回当前通道状态（mini/bigqmt 可用性 + 生效模式），供客户端诊断。"""
+        self._require_auth()
+        try:
+            return XtQuantService._get_router().snapshot()
+        except Exception as exc:
+            logger.warning("[channels] get_channel_status 失败: %s", exc)
+            return {
+                "mode": "unknown",
+                "mini_available": False,
+                "bigqmt_available": False,
+                "checked_at": 0.0,
+                "detail": {"error": str(exc)},
+            }
 
     @log_api_call("ping")
     def exposed_ping(self):
@@ -1844,6 +2073,13 @@ def start_server(host="0.0.0.0", port=None, use_ssl=False, certfile=None, keyfil
 
     # ── 初始化 QmtDataReader 单例 ──────────────────────────────────
     _init_datadir_reader()
+
+    # ── 启动通道路由探测线程（大QMT ↔ miniQMT 无感切换）────────────
+    try:
+        XtQuantService._get_router().start()
+        logger.info("[channels] 通道路由探测线程已启动")
+    except Exception as _e:
+        logger.warning("[channels] 通道路由启动失败（不影响 mini 通道）: %s", _e)
 
     logger.info(f"服务启动 | host={host} | port={port} | ssl={use_ssl}")
     

@@ -29,7 +29,9 @@
   - [3.7 `datadir.etf_list()`](#37-datadiretf_list)
   - [3.8 `datadir.market_list()`](#38-datadirmarket_list)
   - [3.9 `datadir.increase_meta()`](#39-datadirincrease_meta)
-  - [3.10 datadir 不可用时的处理](#310-datadir-不可用时的处理)
+  - [3.10 `datadir.factor_classes()`](#310-datadirfactor_classes)
+  - [3.11 `datadir.factors()`](#311-datadirfactors)
+  - [3.12 datadir 不可用时的处理](#312-datadir-不可用时的处理)
 - [4. 异常与错误处理](#4-异常与错误处理)
   - [4.1 `ConnectionError`](#41-connectionerror)
   - [4.2 `AuthenticationError`](#42-authenticationerror)
@@ -232,6 +234,10 @@ with XtQuantRemote("21.214.136.216", client_secret="xxx") as xt:
     print(f"进度: {result['finished']}/{result['total']}, 完成: {result['done']}")
 ```
 
+**超时行为：** 服务端对 `download_*` 类调用统一加了超时隔离（默认 600 秒，可用环境变量
+`XQSHARE_DOWNLOAD_TIMEOUT` 覆盖）。盘后券商挂起导致底层下载永久阻塞时，超时后会抛
+`TimeoutError`，避免堵死后续下载请求。详见 `doc/download-timeout-gap.md`。
+
 ---
 
 #### `get_all_stocks()`
@@ -319,6 +325,51 @@ def get_service_status(self) -> dict
 with XtQuantRemote("21.214.136.216", client_secret="xxx") as xt:
     status = xt.get_service_status()
     print(f"运行时间: {status['uptime']}s, 活跃连接: {status['active_tokens']}")
+```
+
+---
+
+#### `get_channel_status()`
+
+获取当前行情/交易通道状态（大QMT ↔ miniQMT 无感切换的诊断接口，只读，不影响路由）。
+
+```python
+def get_channel_status(self) -> dict
+```
+
+**参数：** 无
+
+**返回值：** `dict` — 当前通道路由状态：
+
+```python
+{
+    "mode": "auto",            # auto / mini / bigqmt（受 XQSHARE_FORCE_CHANNEL 影响）
+    "mini_available": True,    # 最近一次 mini 通道探测结果
+    "bigqmt_available": False, # 最近一次 bigqmt 通道探测结果
+    "checked_at": 1756000000,  # 最近一次探测时间戳（Unix 秒）
+    "detail": {                # 各通道探测详情（错误信息等）
+        "mini": "...",
+        "bigqmt": "...",
+    }
+}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `mode` | `str` | 当前路由模式：`auto`（自动探测）/ `mini` / `bigqmt`（受 `XQSHARE_FORCE_CHANNEL` 影响） |
+| `mini_available` | `bool` | mini 通道是否可用（进程 + 探活） |
+| `bigqmt_available` | `bool` | bigqmt 通道是否可用（Redis RPC ping） |
+| `checked_at` | `int` | 最近一次探测时间戳（Unix 秒） |
+| `detail` | `dict` | 各通道探测详情，含错误信息 |
+
+**说明：** 通道切换对上层透明，客户端不主动推切换事件；使用方需要感知时主动调用本接口查询。详细设计见 [channel-abstraction.md](channel-abstraction.md)。
+
+**示例：**
+
+```python
+with XtQuantRemote("21.214.136.216", client_secret="xxx") as xt:
+    status = xt.get_channel_status()
+    print(f"模式: {status['mode']}, mini: {status['mini_available']}, bigqmt: {status['bigqmt_available']}")
 ```
 
 ---
@@ -779,7 +830,58 @@ datadir.increase_meta(market: str = 'SH') -> dict
 
 **返回值：** `dict` — 包含 `market`、`file_size`、`n_dates`、`n_stocks`、`decompressed_size` 字段。
 
-### 3.10 datadir 不可用时的处理
+### 3.10 `datadir.factor_classes()`
+
+列出 datadir 下已存在的因子表（英文 modelName）。
+
+```python
+datadir.factor_classes() -> list
+```
+
+**参数：** 无
+
+**返回值：** `list[str]` — 因子表名列表，如 `["factor_growth", "factor_metrics", ...]`。同时识别已下载（`_Xdat2/data.fe`）和仅定义（`_Xdat/config`）两类目录。
+
+### 3.11 `datadir.factors()`
+
+读取因子库数据（feather 文件）。
+
+```python
+datadir.factors(factor_class: str, symbols: list = None,
+                start_date: str = None, end_date: str = None) -> pd.DataFrame
+```
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `factor_class` | `str` | - | 因子表名（英文 modelName，如 `"factor_growth"`） |
+| `symbols` | `list` | `None` | 可选过滤股票代码列表，如 `["600000.SH"]`（兼容纯 6 位代码 `"600000"`） |
+| `start_date` | `str` | `None` | 可选起始日期，`"YYYYMMDD"` 或 `"YYYY-MM-DD"` |
+| `end_date` | `str` | `None` | 可选结束日期，同上 |
+
+**返回值：** `pd.DataFrame` — columns: `symbol`、`date`，以及该因子类下的若干因子数值列。
+
+**依赖与注意：**
+
+- 需要服务端安装 `pyarrow`（`pip install xqshare[datadir]`）。
+- 因子数据文件 `EP/{factor_class}_Xdat2/data.fe` 由 QMT 客户端「扩展数据/因子数据」下载后生成；未下载时调用会抛 `FileNotFoundError`（含提示）。
+
+**示例：**
+
+```python
+with XtQuantRemote("21.214.136.216", client_secret="xxx") as xt:
+    # 列出可用因子表
+    classes = xt.datadir.factor_classes()
+
+    # 读取成长因子，过滤股票池与日期
+    df = xt.datadir.factors(
+        "factor_growth",
+        symbols=["600000.SH", "000001.SZ"],
+        start_date="20240101",
+        end_date="20241231",
+    )
+```
+
+### 3.12 datadir 不可用时的处理
 
 若服务端未配置 `QMT_DATADIR_PATH` 且无法自动推断，调用 `datadir` 相关方法时会抛出 `RuntimeError`：
 

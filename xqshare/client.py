@@ -604,6 +604,7 @@ class XtQuantRemote:
         self._subscriptions = []  # 订阅列表，重连时恢复用
 
         self._xtdata = RemoteModule(self, 'xtdata')
+        self._xttrader = RemoteModule(self, 'xttrader')
         self._xttype = RemoteModule(self, 'xttype')
         self._xtconstant = RemoteModule(self, 'xtconstant')
         self._xtview = RemoteModule(self, 'xtview')
@@ -713,6 +714,7 @@ class XtQuantRemote:
                     
                     # 重连后重置所有 RemoteModule 的内部缓存，下次调用时自动重新获取远程对象
                     self._xtdata._module = None
+                    self._xttrader._module = None
                     self._xttype._module = None
                     self._xtconstant._module = None
                     self._xtview._module = None
@@ -771,6 +773,15 @@ class XtQuantRemote:
     @property
     def xtdata(self):
         return self._xtdata
+
+    @property
+    def xttrader(self):
+        """xtquant.xttrader 模块代理（XtQuantTrader 类等）。
+
+        注意：创建交易实例请用 create_trader() / create_trader_and_connect()，
+        本属性仅用于模块级访问（如 XtQuantTrader 类）。
+        """
+        return self._xttrader
 
     @property
     def xttype(self):
@@ -884,6 +895,16 @@ class XtQuantRemote:
     def get_service_status(self):
         self._ensure_connected()
         return self._conn.root.get_service_status()
+    
+    def get_channel_status(self):
+        """查询服务端通道状态（大QMT ↔ miniQMT 无感切换诊断接口）。
+
+        Returns:
+            dict: {mode, mini_available, bigqmt_available, checked_at, detail}
+                mode: 生效通道 'mini' | 'bigqmt' | 'none'
+        """
+        self._ensure_connected()
+        return self._conn.root.get_channel_status()
     
     def reconnect(self):
         self._reconnect()

@@ -37,6 +37,7 @@ from .kline import read_kline, read_kline_dir
 from .sector import (list_sector_categories, read_all_sectors,
                      read_sector, read_weight)
 from .divid import read_divid
+from .factor import read_factor, list_factor_classes
 from .misc import read_etf_list, read_market_list, read_increase_meta
 
 
@@ -164,6 +165,39 @@ class QmtDataReader:
             dict: market, file_size, n_dates, n_stocks, decompressed_size
         """
         return read_increase_meta(self.data_dir, market)
+
+    # ── 因子库 ────────────────────────────────────────────────────────────────
+
+    def factor_classes(self) -> list:
+        """
+        列出 datadir 下已存在的因子表（英文 modelName）。
+
+        Returns:
+            list[str]，如 ['factor_growth', 'factor_metrics', ...]
+        """
+        return list_factor_classes(self.data_dir)
+
+    def factors(self, factor_class: str,
+                symbols: Optional[list] = None,
+                start_date: Optional[str] = None,
+                end_date: Optional[str] = None) -> pd.DataFrame:
+        """
+        读取因子库数据（feather 文件）。
+
+        Args:
+            factor_class: 因子表名（英文 modelName，如 'factor_growth'）
+            symbols:      可选，股票代码列表（如 ['600000.SH']），过滤
+            start_date:   可选，起始日期（'YYYYMMDD' 或 'YYYY-MM-DD'）
+            end_date:     可选，结束日期（同上）
+
+        Returns:
+            DataFrame，columns: symbol, date, 以及因子数值列。
+            因子数据未下载（无 data.fe）时抛 FileNotFoundError。
+        """
+        return read_factor(self.data_dir, factor_class,
+                           symbols=symbols,
+                           start_date=start_date,
+                           end_date=end_date)
 
     def __repr__(self) -> str:
         return f"QmtDataReader(data_dir='{self.data_dir}')"

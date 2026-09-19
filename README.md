@@ -9,6 +9,7 @@
 - ✅ **断线重连** - 自动检测断线并重连，指数退避策略
 - ✅ **心跳保活** - 定期心跳检测，保持连接活跃
 - ✅ **异步回调** - 支持交易事件（on_stock_*）与行情 tick 订阅回调（`xtdata.register_quote_callback` + `subscribe_whole_quote`）
+- ✅ **无感切换** - 大QMT ↔ miniQMT 无感切换（行情侧），自动探测 miniQMT 可用性，不可用自动切 bigqmt 通道（复用 xtquant_big_convert）
 - ✅ **完整日志** - API调用日志，记录函数名、参数、耗时
 - ✅ **零学习成本** - 无需记忆新 API
 
@@ -51,6 +52,8 @@ pip install -e .
 ```bash
 pip install rpyc
 ```
+
+> **datadir 文件解析功能**需要额外依赖：`pip install "xqshare[datadir]"`（含 `pandas` + `pyarrow`，其中 `pyarrow` 用于因子库 feather 文件解析）。
 
 ## 快速启动
 
@@ -278,6 +281,17 @@ with XtQuantRemote("21.214.136.216", client_secret="my-secret") as xt:
     # 获取单个板块成分股
     bank_stocks = xt.datadir.sector("申万行业", "SW1银行")
     print(f"银行板块：{len(bank_stocks)} 只")
+
+    # 列出可用因子表
+    classes = xt.datadir.factor_classes()  # ['factor_growth', 'factor_metrics', ...]
+
+    # 读取因子库数据（feather 文件，需服务端装 pyarrow）
+    factor_df = xt.datadir.factors(
+        "factor_growth",
+        symbols=["600000.SH"],
+        start_date="20240101",
+        end_date="20241231",
+    )
 ```
 
 ### 全局便捷方式
@@ -300,6 +314,7 @@ df = xqshare.datadir.kline("600000.SH", "1d")
 | 支持实时行情 | ✅ 支持 | ❌ 不支持 |
 | 支持历史 K 线 | ✅ 支持 | ✅ 支持 |
 | 支持板块成分股 | ✅ 支持 | ✅ 支持 |
+| 支持因子库 | 在线接口 | ✅ 支持（feather 解析，需 `pyarrow`） |
 | 适用场景 | 实时/在线场景 | 离线/备用/批量场景 |
 
 ### datadir 不可用时的处理
@@ -464,6 +479,36 @@ xt = XtQuantRemote("21.214.136.216", log_level="DEBUG")
 | --cert | SSL 证书文件 | - |
 | --key | SSL 私钥文件 | - |
 | --log-level | 日志级别 | INFO |
+
+### 下载超时
+
+盘后券商（如平安 QMT）挂起时，`download_*` 类调用会在服务端永久阻塞 worker 线程，
+堵死后续所有下载请求。服务端对下载类调用统一加了超时隔离（独立 daemon 线程 + 超时等待），
+超过阈值后放弃等待并抛 `TimeoutError`，避免挂起堵死后续请求。
+
+| 环境变量 | 默认值 | 说明 |
+|---------|--------|------|
+| `XQSHARE_DOWNLOAD_TIMEOUT` | `600` | `download_*` 调用超时阈值（秒） |
+
+> 注意：超时后底层 xtquant C 库调用无法被 Python 强制中断，挂起的 daemon 线程会残留，
+> 直到 QMT/xqshare 进程重启才回收。详见 [doc/download-timeout-gap.md](doc/download-timeout-gap.md)。
+
+### 通道切换（大QMT ↔ miniQMT 无感切换）
+
+| 环境变量 | 默认值 | 说明 |
+|---------|--------|------|
+| `XQSHARE_BIGQMT_ENABLED` | `false` | 是否启用 bigqmt 通道（mini 不可用时的路由候选） |
+| `XQSHARE_BIGQMT_ALLOW_ORDER` | `false` | 是否允许 bigqmt 通道下单（双重门禁之一） |
+| `XQSHARE_FORCE_CHANNEL` | 空 | 强制通道：空=自动探测，可选 `mini` / `bigqmt` |
+| `XQSHARE_PROBE_INTERVAL` | `30` | 健康探测间隔（秒） |
+| `BIGQMT_ACCOUNT_ID` | — | 大QMT 资金账号（透传给 bigqmt 桥接） |
+| `BIGQMT_REDIS_HOST` | — | Redis 主机 |
+| `BIGQMT_REDIS_PORT` | — | Redis 端口 |
+| `BIGQMT_REDIS_DB` | — | Redis DB 编号 |
+| `BIGQMT_REDIS_PASSWORD` | — | Redis 密码（可选） |
+| `BIGQMT_REDIS_USERNAME` | — | Redis 用户名（可选） |
+
+> 通道抽象层设计见 [doc/channel-abstraction.md](doc/channel-abstraction.md)，大QMT 端部署见 [doc/bigqmt-bridge-deploy.md](doc/bigqmt-bridge-deploy.md)。
 
 ---
 

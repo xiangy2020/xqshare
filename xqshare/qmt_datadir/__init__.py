@@ -9,6 +9,7 @@ qmt_datadir —— QMT 本地 datadir 解析包
   5. ETF成分股列表   TradeDateAndETFStockListCache
   6. 交易所列表      marketlistinfo（Base64）
   7. 涨跌幅快照元数据 increase/{market}（ZiPeDiT+zlib 压缩位图）
+  8. 因子库         EP/{factor}_Xdat2/data.fe（feather，需 pyarrow）
 
 快速使用：
     from xqshare.qmt_datadir import QmtDataReader
@@ -43,6 +44,9 @@ from .sector import (
 # ── 分红除权 ──────────────────────────────────────────────────────────────────
 from .divid import read_divid
 
+# ── 因子库 ────────────────────────────────────────────────────────────────────
+from .factor import read_factor, list_factor_classes
+
 # ── 杂项 ──────────────────────────────────────────────────────────────────────
 from .misc import (
     read_etf_list,
@@ -66,6 +70,9 @@ __all__ = [
     'read_weight',
     # 分红除权
     'read_divid',
+    # 因子库
+    'read_factor',
+    'list_factor_classes',
     # 杂项
     'read_etf_list',
     'read_market_list',
