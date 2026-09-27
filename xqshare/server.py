@@ -563,12 +563,16 @@ class _QuoteEventCallback:
         # key 用 id(netref)（本地内存地址）而非 netref 本身：
         # set 的 add/discard 会对 netref 求 hash（触发 RPC），客户端断开后
         # 该 RPC 会抛 EOFError，导致 dispatch 线程崩溃。id() 是纯本地操作。
-        self._subscribers = {}  # id(client_callback_netref) -> client_callback_netref
+        # value 记录 client_info，供 on_disconnect 按连接清理（修复 netref 累积泄漏）。
+        self._subscribers = {}  # id(client_callback_netref) -> {callback, client_info}
         self._running = True
         self._queue = []
         self._queue_lock = threading.Lock()
         self._event_thread = threading.Thread(target=self._dispatch_loop, daemon=True)
         self._event_thread.start()
+        # 订阅者数量告警水位：超过阈值打 warning，用于观察是否仍存在泄漏
+        self._max_subscribers_warning = _get_max_quote_subscribers()
+        self._warned = False
 
     def __call__(self, data):
         """使路由器可被 xtquant 作为函数式 callback 调用。
@@ -604,7 +608,7 @@ class _QuoteEventCallback:
                 continue
             for payload in batch:
                 with self._lock:
-                    callbacks = list(self._subscribers.values())
+                    callbacks = [entry['callback'] for entry in self._subscribers.values()]
                 for cb in callbacks:
                     try:
                         cb.exposed_on_quote_event(payload)
@@ -613,14 +617,57 @@ class _QuoteEventCallback:
                         logger.warning(f"[QuoteEvent] 推送到客户端失败，自动移除: {e}")
                         self.unregister(cb)
 
-    def register(self, client_callback):
+    def register(self, client_callback, client_info: Optional[str] = None):
         with self._lock:
-            self._subscribers[id(client_callback)] = client_callback
+            if client_info is not None:
+                # 幂等化：同一 client_info 重复 register（客户端断线重连后新 netref
+                # 的 id 不同）时，先移除该 client 的旧 entry，避免按 id(netref) 累积。
+                stale = [
+                    cid for cid, entry in self._subscribers.items()
+                    if entry['client_info'] == client_info
+                ]
+                for cid in stale:
+                    self._subscribers.pop(cid, None)
+            self._subscribers[id(client_callback)] = {
+                'callback': client_callback,
+                'client_info': client_info,
+            }
+        self._maybe_warn_subscriber_count()
         logger.info(f"[QuoteEvent] 注册订阅者 total={len(self._subscribers)}")
 
     def unregister(self, client_callback):
         with self._lock:
             self._subscribers.pop(id(client_callback), None)
+
+    def clear_client_callbacks(self, client_info: Optional[str]):
+        """按连接清理该客户端注册的所有 quote 回调（on_disconnect 调用）。"""
+        if client_info is None:
+            return
+        with self._lock:
+            stale = [
+                cid for cid, entry in self._subscribers.items()
+                if entry['client_info'] == client_info
+            ]
+            for cid in stale:
+                self._subscribers.pop(cid, None)
+        if stale:
+            logger.info(
+                f"[QuoteEvent] 清理断开客户端的订阅者: client={client_info} "
+                f"removed={len(stale)} total={len(self._subscribers)}"
+            )
+
+    def _maybe_warn_subscriber_count(self):
+        """订阅者数量超过水位时打 warning（回落时复位，便于反复告警）。"""
+        n = len(self._subscribers)
+        if n > self._max_subscribers_warning:
+            if not self._warned:
+                self._warned = True
+                logger.warning(
+                    f"[QuoteEvent] 订阅者数量异常: total={n} "
+                    f"(阈值 {self._max_subscribers_warning})，可能存在回调泄漏"
+                )
+        elif self._warned:
+            self._warned = False
 
     def stop(self):
         self._running = False
@@ -653,6 +700,15 @@ def _get_download_timeout() -> int:
 
 
 DOWNLOAD_TIMEOUT_SECONDS = _get_download_timeout()
+
+
+def _get_max_quote_subscribers() -> int:
+    """读取 quote 订阅者告警水位，默认 500，可用 env XQSHARE_MAX_QUOTE_SUBSCRIBERS 覆盖。"""
+    raw = os.environ.get("XQSHARE_MAX_QUOTE_SUBSCRIBERS", "500")
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 500
 
 
 def _call_download_with_timeout(fn, *args, timeout=None, name=None, **kwargs):
@@ -790,13 +846,13 @@ class LoggingProxy:
                         pos = _QUOTE_SUBSCRIBE_CALLBACK_POS[name]
                         client_callback = kwargs.pop('callback', None)
                         if client_callback is not None:
-                            # 客户端传了接收器（netref），注册到路由器
-                            quote_event_callback.register(client_callback)
+                            # 客户端传了接收器（netref），注册到路由器（带 client_info 供断线清理）
+                            quote_event_callback.register(client_callback, get_client_info())
                             kwargs['callback'] = quote_event_callback
                         elif len(args) > pos:
                             args = list(args)
                             if args[pos] is not None:
-                                quote_event_callback.register(args[pos])
+                                quote_event_callback.register(args[pos], get_client_info())
                             args[pos] = quote_event_callback
                             args = tuple(args)
                         else:
@@ -915,9 +971,15 @@ class XtQuantService(rpyc.Service):
     def on_disconnect(self, conn):
         client_info = getattr(self, '_client_info', 'unknown')
         logger.info(f"[断开] 客户端离开: {client_info}")
-        # 自动清理本次连接创建的所有 trader 实例，防止 session 资源泄漏
+        # 清理本连接注册的 quote 行情回调（根因：netref 随重连累积，只进不出）
+        qec = XtQuantService._quote_event_callback
+        if qec is not None:
+            qec.clear_client_callbacks(client_info)
+        # 自动清理本次连接创建的所有 trader 实例及其事件路由器，
+        # 含停止 _TraderEventCallback 的 dispatch daemon 线程（否则线程持
+        # 有回调对象与 netref，随断线累积泄漏）
         traders = getattr(self, '_traders', [])
-        for trader in traders:
+        for trader, event_callback in traders:
             # disconnect() 在部分 xtquant 版本中不存在，仅作可选清理
             if hasattr(trader, 'disconnect'):
                 try:
@@ -930,6 +992,12 @@ class XtQuantService(rpyc.Service):
                 logger.info(f"[清理Trader] 已自动 stop trader | client={client_info}")
             except Exception as e:
                 logger.warning(f"[清理Trader] stop trader 失败: {e} | client={client_info}")
+            if event_callback is not None and hasattr(event_callback, 'stop'):
+                try:
+                    event_callback.stop()
+                    logger.info(f"[清理Trader] 已停止事件路由器线程 | client={client_info}")
+                except Exception as e:
+                    logger.warning(f"[清理Trader] 停止事件路由器线程失败: {e} | client={client_info}")
 
     def _delayed_disconnect(self, delay: float = 0.5):
         """延迟断开连接，确保异常能传输到客户端"""
@@ -1098,12 +1166,12 @@ class XtQuantService(rpyc.Service):
 
         logger.info(f"[创建Trader] userdata_path={userdata_path} | session_id={session_id}")
 
-        # 记录 trader 实例，供 on_disconnect 时自动清理
-        self._traders.append(trader)
-
         # 每个 trader 独立一个事件路由器，用于把 on_stock_* 推送给远端客户端
         event_callback = _TraderEventCallback()
         trader.register_callback(event_callback)
+
+        # 记录 trader + 事件路由器，供 on_disconnect 时自动清理（含停止线程）
+        self._traders.append((trader, event_callback))
 
         # 用 LoggingProxy 包装 trader，支持日志记录、序列化和事件回调透传
         return LoggingProxy(
@@ -1143,8 +1211,8 @@ class XtQuantService(rpyc.Service):
         )
         trader.register_callback(adapter)
 
-        # 记录 trader 实例，供 on_disconnect 时自动清理
-        self._traders.append(trader)
+        # 记录 trader + 事件路由器，供 on_disconnect 时自动清理（含停止线程）
+        self._traders.append((trader, event_callback))
 
         return LoggingProxy(
             trader, 'xttrader',
@@ -1176,18 +1244,23 @@ class XtQuantService(rpyc.Service):
 
         logger.info(f"[创建并连接大QMT Trader] account_id={account_id} | session_id={session_id}")
 
-        start_result = trader.start()
-        logger.info(f"[大QMT Trader] start() 返回: {start_result}")
-        if start_result not in (0, None):
-            raise RuntimeError(f"启动大QMT 交易线程失败，错误码: {start_result}")
+        try:
+            start_result = trader.start()
+            logger.info(f"[大QMT Trader] start() 返回: {start_result}")
+            if start_result not in (0, None):
+                raise RuntimeError(f"启动大QMT 交易线程失败，错误码: {start_result}")
 
-        # bigqmt connect() 同步：内部 RPC ping + 合成 on_account_status；失败抛异常
-        connect_result = trader.connect()
-        logger.info(f"[大QMT Trader] connect() 返回: {connect_result}")
-        if connect_result not in (0, None):
-            raise ConnectionError(f"大QMT 连接失败: 错误码 {connect_result}")
+            # bigqmt connect() 同步：内部 RPC ping + 合成 on_account_status；失败抛异常
+            connect_result = trader.connect()
+            logger.info(f"[大QMT Trader] connect() 返回: {connect_result}")
+            if connect_result not in (0, None):
+                raise ConnectionError(f"大QMT 连接失败: 错误码 {connect_result}")
+        except Exception:
+            # 失败路径也要停止事件路由器线程，避免泄漏
+            event_callback.stop()
+            raise
 
-        self._traders.append(trader)
+        self._traders.append((trader, event_callback))
 
         return LoggingProxy(
             trader, 'xttrader',
@@ -1247,48 +1320,56 @@ class XtQuantService(rpyc.Service):
 
         logger.info(f"[创建并连接Trader] userdata_path={userdata_path} | session_id={session_id}")
 
-        start_result = trader.start()
-        logger.info(f"[Trader] start() 返回: {start_result}")
-        if start_result not in (0, None):
-            raise RuntimeError(f"启动交易线程失败，错误码: {start_result}")
+        try:
+            start_result = trader.start()
+            logger.info(f"[Trader] start() 返回: {start_result}")
+            if start_result not in (0, None):
+                raise RuntimeError(f"启动交易线程失败，错误码: {start_result}")
 
-        connect_result = trader.connect()
-        logger.info(f"[Trader] connect() 返回: {connect_result}")
-        if connect_result not in (0, None):
-            error_codes = {
-                -1: "交易服务器未连接",
-                -2: "账号未登录",
-                -3: "请求超时",
-                -4: "资金账号不存在",
-            }
-            raise ConnectionError(f"连接失败: {error_codes.get(connect_result, f'错误码 {connect_result}')}")
+            connect_result = trader.connect()
+            logger.info(f"[Trader] connect() 返回: {connect_result}")
+            if connect_result not in (0, None):
+                error_codes = {
+                    -1: "交易服务器未连接",
+                    -2: "账号未登录",
+                    -3: "请求超时",
+                    -4: "资金账号不存在",
+                }
+                raise ConnectionError(f"连接失败: {error_codes.get(connect_result, f'错误码 {connect_result}')}")
 
-        # 等待真实的交易连接建立
-        connected = callback.wait_for_connected(connect_timeout)
-        logger.info(f"[Trader] on_connected 回调状态: {connected}")
-        if not connected:
-            # 某些版本的 xtquant 可能不会触发 on_connected 回调，
-            # 尝试用 query_stock_asset 验证连接是否真正可用
-            logger.info("[Trader] on_connected 未触发，尝试 query_stock_asset 验证连接...")
+            # 等待真实的交易连接建立
+            connected = callback.wait_for_connected(connect_timeout)
+            logger.info(f"[Trader] on_connected 回调状态: {connected}")
+            if not connected:
+                # 某些版本的 xtquant 可能不会触发 on_connected 回调，
+                # 尝试用 query_stock_asset 验证连接是否真正可用
+                logger.info("[Trader] on_connected 未触发，尝试 query_stock_asset 验证连接...")
+                try:
+                    from xtquant.xttype import StockAccount
+                    account_id = os.environ.get("QMT_ACCOUNT_ID")
+                    if account_id:
+                        test_account = StockAccount(account_id)
+                        asset = trader.query_stock_asset(test_account)
+                        logger.info(f"[Trader] query_stock_asset 验证成功: {asset}")
+                        connected = True
+                except Exception as e:
+                    logger.warning(f"[Trader] query_stock_asset 验证失败: {e}")
+
+            if not connected:
+                raise TimeoutError(
+                    f"等待交易连接建立超时（{connect_timeout}秒），"
+                    "请检查 MiniQMT 是否已登录交易账号，或设置更长的 --connect-timeout"
+                )
+        except Exception:
+            # 失败路径：停止 trader 与事件路由器线程，避免泄漏
             try:
-                from xtquant.xttype import StockAccount
-                account_id = os.environ.get("QMT_ACCOUNT_ID")
-                if account_id:
-                    test_account = StockAccount(account_id)
-                    asset = trader.query_stock_asset(test_account)
-                    logger.info(f"[Trader] query_stock_asset 验证成功: {asset}")
-                    connected = True
-            except Exception as e:
-                logger.warning(f"[Trader] query_stock_asset 验证失败: {e}")
+                trader.stop()
+            except Exception:
+                pass
+            callback.stop()
+            raise
 
-        if not connected:
-            trader.stop()
-            raise TimeoutError(
-                f"等待交易连接建立超时（{connect_timeout}秒），"
-                "请检查 MiniQMT 是否已登录交易账号，或设置更长的 --connect-timeout"
-            )
-
-        self._traders.append(trader)
+        self._traders.append((trader, callback))
 
         return LoggingProxy(
             trader, 'xttrader',

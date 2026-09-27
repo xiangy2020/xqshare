@@ -30,7 +30,7 @@ sys.modules['xtquant.xttype'] = mock_xttype
 from xqshare.server import _init_logging
 _init_logging("WARNING")
 
-from xqshare.server import LoggingProxy, _QuoteEventCallback
+from xqshare.server import LoggingProxy, XtQuantService, _QuoteEventCallback
 from xqshare.client import RemoteQuoteCallback
 from xqshare.auth import AccountLevel
 
@@ -118,6 +118,83 @@ class TestQuoteEventCallback:
         finally:
             qec.stop()
 
+    def test_register_idempotent_per_client(self):
+        """同一 client_info 重复 register（断线重连后新 netref）应覆盖旧 entry 而非累积"""
+        qec = _QuoteEventCallback()
+        try:
+            old_cb = MagicMock()
+            new_cb = MagicMock()
+            qec.register(old_cb, client_info="c1@127.0.0.1:1")
+            qec.register(new_cb, client_info="c1@127.0.0.1:1")
+
+            assert len(qec._subscribers) == 1, "重连后旧 netref 应被覆盖，不累积"
+            entry = next(iter(qec._subscribers.values()))
+            assert entry['callback'] is new_cb
+        finally:
+            qec.stop()
+
+    def test_register_without_client_info_no_dedup(self):
+        """client_info 为 None 时不做幂等去重（保持原语义，按 id 累积）"""
+        qec = _QuoteEventCallback()
+        try:
+            qec.register(MagicMock())
+            qec.register(MagicMock())
+            assert len(qec._subscribers) == 2
+        finally:
+            qec.stop()
+
+    def test_clear_client_callbacks(self):
+        """clear_client_callbacks 只清理指定 client 的回调，不影响其他 client"""
+        qec = _QuoteEventCallback()
+        try:
+            cb1, cb2, cb3 = MagicMock(), MagicMock(), MagicMock()
+            qec.register(cb1, client_info="c1@127.0.0.1:1")
+            qec.register(cb2, client_info="c1@127.0.0.1:1")
+            qec.register(cb3, client_info="c2@127.0.0.1:2")
+
+            qec.clear_client_callbacks("c1@127.0.0.1:1")
+
+            remaining = [e['callback'] for e in qec._subscribers.values()]
+            assert remaining == [cb3], "只应保留其他 client 的回调"
+        finally:
+            qec.stop()
+
+    def test_on_disconnect_clears_quote_subscribers(self):
+        """on_disconnect 应清理该连接注册的 quote 回调，避免 netref 累积泄漏"""
+        qec = _QuoteEventCallback()
+        original = XtQuantService._quote_event_callback
+        XtQuantService._quote_event_callback = qec
+        try:
+            service = XtQuantService()
+            service._client_info = "c1@127.0.0.1:1"
+            service._traders = []
+            qec.register(MagicMock(), client_info="c1@127.0.0.1:1")
+            qec.register(MagicMock(), client_info="c2@127.0.0.1:2")
+
+            service.on_disconnect(MagicMock())
+
+            remaining = [e['client_info'] for e in qec._subscribers.values()]
+            assert remaining == ["c2@127.0.0.1:2"], "断开连接的客户端回调应被清理"
+        finally:
+            qec.stop()
+            XtQuantService._quote_event_callback = original
+
+    def test_on_disconnect_without_quote_callback(self):
+        """quote 单例未初始化时 on_disconnect 不应报错，也不应创建单例"""
+        original = XtQuantService._quote_event_callback
+        XtQuantService._quote_event_callback = None
+        try:
+            service = XtQuantService()
+            service._client_info = "c1@127.0.0.1:1"
+            service._traders = []
+
+            service.on_disconnect(MagicMock())
+
+            assert XtQuantService._quote_event_callback is None, \
+                "不应在断开时懒创建 quote 单例"
+        finally:
+            XtQuantService._quote_event_callback = original
+
 
 class TestLoggingProxyQuoteIntercept:
     """LoggingProxy 拦截 xtdata 订阅并接管 callback"""
@@ -143,8 +220,10 @@ class TestLoggingProxyQuoteIntercept:
 
             kwargs = mock.subscribe_whole_quote.call_args.kwargs
             assert kwargs["callback"] is qec, "原生 callback 应由服务端路由器接管"
-            assert len(qec._subscribers) == 1 and next(iter(qec._subscribers.values())) is client_cb, \
-                "客户端回调应注册到路由器"
+            assert len(qec._subscribers) == 1, "客户端回调应注册到路由器"
+            entry = next(iter(qec._subscribers.values()))
+            assert entry['callback'] is client_cb
+            assert entry['client_info'] == "test-client", "应记录 client_info 供断线清理"
         finally:
             qec.stop()
 

@@ -195,6 +195,49 @@ class TestXtQuantService:
         assert "test_token" not in service._tokens
 
 
+class TestTraderCallbackCleanup:
+    """测试 trader 事件路由器线程的清理（防泄漏）"""
+
+    def test_on_disconnect_stops_trader_event_callback(self):
+        """on_disconnect 应停止该连接创建的事件路由器 dispatch 线程"""
+        from xqshare.server import _TraderEventCallback
+        service = XtQuantService()
+        service._conn = Mock()
+        service._conn.peer = "127.0.0.1:12345"
+        service._client_info = "test_client@127.0.0.1:12345"
+        trader = Mock()
+        cb = _TraderEventCallback()
+        service._traders = [(trader, cb)]
+        try:
+            service.on_disconnect(service._conn)
+
+            assert cb._running is False, "on_disconnect 应停止事件路由器线程"
+            trader.stop.assert_called_once()
+        finally:
+            cb.stop()
+
+    def test_trader_event_callback_stop_terminates_thread(self):
+        """_TraderEventCallback.stop() 应让 dispatch daemon 线程退出"""
+        from xqshare.server import _TraderEventCallback
+        cb = _TraderEventCallback()
+        thread = cb._event_thread
+        assert thread.is_alive(), "dispatch 线程应在创建后运行"
+
+        cb.stop()
+        thread.join(timeout=3.0)
+        assert not thread.is_alive(), "stop() 后 dispatch 线程应退出"
+
+    def test_trader_event_callback_stop_idempotent(self):
+        """stop() 多次调用应无副作用"""
+        from xqshare.server import _TraderEventCallback
+        cb = _TraderEventCallback()
+        thread = cb._event_thread
+        cb.stop()
+        cb.stop()
+        thread.join(timeout=3.0)
+        assert not thread.is_alive()
+
+
 class TestSSLContext:
     """测试 SSL 上下文创建"""
     
