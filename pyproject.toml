@@ -65,10 +65,10 @@ xtdata = "xqshare.tools.xtdata:main"
 xttrader = "xqshare.tools.xttrader:main"
 
 [project.urls]
-Homepage = "https://gitee.com/jdragonhu/xqshare"
-Documentation = "https://gitee.com/jdragonhu/xqshare#readme"
-Repository = "https://gitee.com/jdragonhu/xqshare"
-Issues = "https://gitee.com/jdragonhu/xqshare/issues"
+Homepage = "https://github.com/xiangy2020/xqshare"
+Documentation = "https://github.com/xiangy2020/xqshare#readme"
+Repository = "https://github.com/xiangy2020/xqshare"
+Issues = "https://github.com/xiangy2020/xqshare/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]
