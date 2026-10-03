@@ -272,6 +272,54 @@ class TestLoggingProxyQuoteIntercept:
         finally:
             qec.stop()
 
+    def test_subscribe_idempotent_unsubscribe_old_seq(self):
+        """同一 client 重复订阅同一 code_list，应先 unsubscribe 旧 seq 再订阅（防 miniquote 累积）"""
+        mock = MagicMock()
+        mock.subscribe_whole_quote.side_effect = [1, 2]
+        mock.unsubscribe_quote = MagicMock()
+        qec = _QuoteEventCallback()
+        try:
+            proxy = self._proxy(mock, qec)
+            client_cb = MagicMock()
+            proxy.subscribe_whole_quote(["000001.SZ"], callback=client_cb)  # seq=1
+            proxy.subscribe_whole_quote(["000001.SZ"], callback=client_cb)  # seq=2，先 unsubscribe 1
+
+            mock.unsubscribe_quote.assert_called_once_with(1)
+            assert mock.subscribe_whole_quote.call_count == 2
+        finally:
+            qec.stop()
+
+    def test_subscribe_different_codes_no_unsubscribe(self):
+        """不同 code_list 的订阅互不影响，不应触发 unsubscribe"""
+        mock = MagicMock()
+        mock.subscribe_whole_quote.side_effect = [1, 2]
+        mock.unsubscribe_quote = MagicMock()
+        qec = _QuoteEventCallback()
+        try:
+            proxy = self._proxy(mock, qec)
+            proxy.subscribe_whole_quote(["000001.SZ"])
+            proxy.subscribe_whole_quote(["000002.SZ"])
+
+            mock.unsubscribe_quote.assert_not_called()
+        finally:
+            qec.stop()
+
+    def test_subscription_seq_record_and_clear(self):
+        """seq 管理：record → get 命中，clear 后 unsubscribe 所有 seq"""
+        qec = _QuoteEventCallback()
+        try:
+            key = ("subscribe_whole_quote", ("000001.SZ",))
+            qec.record_subscription("c1", key, 1)
+            assert qec.get_subscription_seq("c1", key) == 1
+            assert qec.get_subscription_seq("c1", ("subscribe_whole_quote", ("000002.SZ",))) is None
+
+            unsubscribed = []
+            qec.clear_client_subscriptions("c1", lambda seq: unsubscribed.append(seq))
+            assert unsubscribed == [1]
+            assert qec.get_subscription_seq("c1", key) is None
+        finally:
+            qec.stop()
+
 
 class TestRemoteQuoteCallback:
     """客户端行情回调接收器"""

@@ -8,6 +8,7 @@
 - ✅ **认证加密** - 支持 HMAC token 认证，可选 SSL/TLS 加密
 - ✅ **断线重连** - 自动检测断线并重连，指数退避策略
 - ✅ **心跳保活** - 定期心跳检测，保持连接活跃
+- ✅ **服务实例标识** - `get_instance_id()` 轻量感知 server 重启；行情订阅幂等自动去重，阻断底层 miniquote 订阅累积
 - ✅ **异步回调** - 支持交易事件（on_stock_*）与行情 tick 订阅回调（`xtdata.register_quote_callback` + `subscribe_whole_quote`）
 - ✅ **无感切换** - 大QMT ↔ miniQMT 无感切换（行情侧），自动探测 miniQMT 可用性，不可用自动切 bigqmt 通道（复用 xtquant_big_convert）
 - ✅ **完整日志** - API调用日志，记录函数名、参数、耗时
@@ -759,6 +760,7 @@ print(status)
 
 | 版本 | 日期 | 更新内容 |
 |------|------|----------|
+| 1.4.0 | 2026-10-03 | 新增 `get_instance_id()` 服务实例标识（轻量感知 server 重启）；行情订阅幂等（重复订阅自动释放旧 seq，阻断 miniquote 订阅累积泄漏） |
 | 1.1.1 | 2026-03-18 | 新增 xtview 模块支持（视图控制、调度任务管理），兼容不同 xtquant 版本 |
 | 1.1.0 | 2026-03-17 | 交易功能优化完善、`xqshare-server` 命令、`.env` 配置支持、远程对象传输性能优化 |
 | 1.0.4 | 2026-03-09 | JSON 输出优化：远程 DataFrame 高效序列化、`--compact` 参数、全局参数位置灵活、嵌套结构支持 |

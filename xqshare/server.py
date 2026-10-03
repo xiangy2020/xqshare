@@ -13,6 +13,7 @@ import logging
 import functools
 import json
 import threading
+import uuid
 from datetime import datetime
 from typing import Any, Dict, Optional
 
@@ -565,6 +566,10 @@ class _QuoteEventCallback:
         # 该 RPC 会抛 EOFError，导致 dispatch 线程崩溃。id() 是纯本地操作。
         # value 记录 client_info，供 on_disconnect 按连接清理（修复 netref 累积泄漏）。
         self._subscribers = {}  # id(client_callback_netref) -> {callback, client_info}
+        # 订阅幂等：client_info -> {code_key -> seq}。code_key = (方法名, 规范化code_list)。
+        # 同一 client 重复订阅同一 code_key 时先 unsubscribe 旧 seq 再订阅，
+        # 避免 miniquote 侧订阅累积（曾导致 miniquote 内存泄漏拖垮整机）。
+        self._subscriptions = {}
         self._running = True
         self._queue = []
         self._queue_lock = threading.Lock()
@@ -656,6 +661,38 @@ class _QuoteEventCallback:
                 f"removed={len(stale)} total={len(self._subscribers)}"
             )
 
+    def get_subscription_seq(self, client_info: Optional[str], code_key):
+        """查该 client 是否已订阅过 code_key，返回旧 seq（未订阅返回 None）。"""
+        with self._lock:
+            subs = self._subscriptions.get(client_info)
+            if subs:
+                return subs.get(code_key)
+        return None
+
+    def record_subscription(self, client_info: Optional[str], code_key, seq):
+        """记录该 client 对 code_key 的最新订阅 seq（供下次重复订阅时先释放旧 seq）。"""
+        if client_info is None or seq is None:
+            return
+        with self._lock:
+            self._subscriptions.setdefault(client_info, {})[code_key] = seq
+
+    def clear_client_subscriptions(self, client_info: Optional[str], unsubscribe_func):
+        """清理该 client 的所有 miniquote 订阅（unsubscribe 所有 seq），on_disconnect 调用。"""
+        if client_info is None:
+            return
+        with self._lock:
+            subs = self._subscriptions.pop(client_info, None)
+        if not subs:
+            return
+        for seq in subs.values():
+            try:
+                unsubscribe_func(seq)
+            except Exception as exc:
+                logger.warning(f"[QuoteEvent] 清理订阅失败 seq={seq}: {exc}")
+        logger.info(
+            f"[QuoteEvent] 清理断开客户端的订阅: client={client_info} removed={len(subs)}"
+        )
+
     def _maybe_warn_subscriber_count(self):
         """订阅者数量超过水位时打 warning（回落时复位，便于反复告警）。"""
         n = len(self._subscribers)
@@ -679,6 +716,40 @@ _QUOTE_SUBSCRIBE_CALLBACK_POS = {
     'subscribe_quote': 5,
     'subscribe_quote2': 6,
 }
+
+
+# ==================== 服务实例标识 ====================
+
+# server 进程启动时生成的唯一标识，用于让客户端轻量感知 server 重启：
+# 客户端通过 get_instance_id() 对比该值，一旦变化说明 server 重启过，
+# 内存态的订阅/回调状态已丢失，需要重新订阅。避免用「重复订阅 + seq 回退」
+# 这种重且带副作用的方式探测重启（曾导致 miniquote 订阅累积泄漏）。
+_INSTANCE_ID = uuid.uuid4().hex
+
+
+def _normalize_code_key(code_list) -> tuple:
+    """把订阅的 code_list 规范化为可哈希的元组，用于订阅幂等去重。
+
+    subscribe_whole_quote 的 code_list 是 list（如 ['688523.SH'] / ['SH','SZ']），
+    subscribe_quote/quote2 的 stock_code 是单个 str。统一转成排序后的 tuple。
+    """
+    if isinstance(code_list, (list, tuple, set)):
+        return tuple(sorted(str(c) for c in code_list))
+    if isinstance(code_list, str):
+        return (code_list,)
+    return (str(code_list),)
+
+
+def _unsubscribe_safely(target, seq):
+    """安全地取消一个 miniquote 订阅（unsubscribe_quote），失败不抛出。"""
+    if seq is None:
+        return
+    try:
+        unsubscribe = getattr(target, 'unsubscribe_quote', None)
+        if unsubscribe is not None:
+            unsubscribe(seq)
+    except Exception as exc:
+        logger.warning(f"[QuoteEvent] 取消旧订阅失败 seq={seq}: {exc}")
 
 
 # ==================== download 类调用超时隔离 ====================
@@ -808,6 +879,7 @@ class LoggingProxy:
         if callable(attr):
             def wrapper(*args, **kwargs):
                 full_name = f"{target_name}.{name}"
+                _sub_key = None  # 订阅幂等：本次调用的 code_key，供 _log_call 后记录 seq
 
                 # 权限检查
                 if permission_checker and account_level:
@@ -844,6 +916,11 @@ class LoggingProxy:
                 if target_name == 'xtdata' and quote_event_callback is not None:
                     if name in _QUOTE_SUBSCRIBE_CALLBACK_POS:
                         pos = _QUOTE_SUBSCRIBE_CALLBACK_POS[name]
+                        # 订阅幂等：提取 code_key（方法名 + 规范化 code_list），
+                        # 同一 client 重复订阅时先 unsubscribe 旧 seq，避免 miniquote 累积。
+                        _code_list = _deliver(args[0]) if args else kwargs.get('stock_code')
+                        if _code_list is not None:
+                            _sub_key = (name, _normalize_code_key(_code_list))
                         client_callback = kwargs.pop('callback', None)
                         if client_callback is not None:
                             # 客户端传了接收器（netref），注册到路由器（带 client_info 供断线清理）
@@ -858,6 +935,11 @@ class LoggingProxy:
                         else:
                             # 未传回调：仍用服务端路由器接管（此时无订阅者，数据被丢弃）
                             kwargs['callback'] = quote_event_callback
+                        # 幂等：重复订阅先释放旧 seq（失败不阻断本次订阅）
+                        if _sub_key is not None:
+                            old_seq = quote_event_callback.get_subscription_seq(get_client_info(), _sub_key)
+                            if old_seq is not None:
+                                _unsubscribe_safely(target, old_seq)
 
                 # download 类调用统一加超时隔离：对直通底层 xtquant 的 download
                 # 方法（无 exposed_* 封装的）包进 _call_download_with_timeout，
@@ -869,6 +951,12 @@ class LoggingProxy:
                     )
                 else:
                     result = _log_call(full_name, get_client_info(), attr, *args, **kwargs)
+
+                # 订阅幂等：记录本次订阅返回的 seq，供下次重复订阅时先释放旧 seq
+                if _sub_key is not None:
+                    _seq = _deliver(result)
+                    if isinstance(_seq, int):
+                        quote_event_callback.record_subscription(get_client_info(), _sub_key, _seq)
 
                 # 如果返回的是复杂对象（非基本类型），递归包装
                 if result is not None and hasattr(result, '__class__'):
@@ -975,6 +1063,12 @@ class XtQuantService(rpyc.Service):
         qec = XtQuantService._quote_event_callback
         if qec is not None:
             qec.clear_client_callbacks(client_info)
+            # 清理本连接向 miniquote 建立的所有订阅（unsubscribe 所有 seq），
+            # 避免 miniquote 侧订阅累积泄漏（根因：反复订阅不取消）。
+            qec.clear_client_subscriptions(
+                client_info,
+                lambda seq: _unsubscribe_safely(XtQuantService._xtdata, seq),
+            )
         # 自动清理本次连接创建的所有 trader 实例及其事件路由器，
         # 含停止 _TraderEventCallback 的 dispatch daemon 线程（否则线程持
         # 有回调对象与 netref，随断线累积泄漏）
@@ -1043,6 +1137,16 @@ class XtQuantService(rpyc.Service):
     @log_api_call("heartbeat")
     def exposed_heartbeat(self):
         return "pong"
+
+    @log_api_call("get_instance_id")
+    def exposed_get_instance_id(self):
+        """返回本 server 进程的实例标识。
+
+        供客户端轻量感知 server 重启：该值在每次 server 进程启动时变化。
+        客户端可周期性对比（例如复用现有 heartbeat 流程或单独轮询），
+        一旦变化即说明订阅/回调等内存态已丢失，需要重新订阅。
+        """
+        return _INSTANCE_ID
 
     # ==================== 模块代理接口 ====================
 

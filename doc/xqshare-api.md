@@ -623,6 +623,12 @@ xt.xtdata.unregister_quote_callback(on_tick)
 # 或 xqshare.client.unregister_quote_callback(on_tick)
 ```
 
+**订阅幂等（server 侧自动处理）：**
+
+同一客户端重复订阅相同的 code_list 时，server 会自动先取消旧订阅再订阅（`unsubscribe_quote(旧 seq)` → 重新订阅），避免底层 miniquote 反复堆积订阅导致内存泄漏；客户端断线时也会自动清理该客户端的所有订阅。
+
+> 因此客户端可安全地周期性重复订阅，不会在底层累积订阅。但更推荐的做法是用 [`get_instance_id()`](#52-服务实例标识) 感知 server 重启，仅在重启后才重新订阅，避免无谓的订阅开销。
+
 **回调签名：**
 
 | 参数 | 类型 | 说明 |
@@ -1058,7 +1064,34 @@ while not stop_event.is_set():
     stop_event.wait(heartbeat_interval)
 ```
 
-### 5.3 ReconnectPolicy 重连策略
+### 5.3 服务实例标识（感知 server 重启）
+
+`get_instance_id()` 返回当前 server 进程的唯一标识，**每次 server 启动都会变化**。客户端可用它轻量感知 server 重启，无需重复订阅。
+
+```python
+instance_id = xt.conn.root.get_instance_id()
+```
+
+**推荐用法（替代「重复订阅探测重启」）：**
+
+```python
+last_id = None
+while True:
+    try:
+        cur = conn.root.get_instance_id()
+        if last_id is not None and cur != last_id:
+            # server 重启过，内存态订阅/回调已失效，需重新订阅
+            resubscribe()
+        last_id = cur
+    except Exception:
+        # 连接异常：重连后重新订阅
+        reconnect_and_resubscribe()
+    sleep(interval)
+```
+
+> **背景**：server 重启会丢失内存态的订阅与回调。旧方案「周期性重复订阅 + seq 回退」能探测重启，但每次重复订阅都会向底层 miniquote 新建订阅（曾导致 miniquote 内存泄漏拖垮整机）。`get_instance_id()` 是零副作用的轻量探测方式。
+
+### 5.4 ReconnectPolicy 重连策略
 
 ```python
 class ReconnectPolicy:
@@ -1106,7 +1139,7 @@ xt = XtQuantRemote(
 
 - `connection`、`closed`、`reset`、`broken`、`timeout`、`refused`、`eof`、`socket`
 
-### 5.4 重连后自动恢复
+### 5.5 重连后自动恢复
 
 重连成功后，xqshare 自动执行以下恢复操作：
 

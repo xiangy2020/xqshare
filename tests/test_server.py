@@ -477,5 +477,26 @@ class TestInitDatadirReader:
             XtQuantService._xtdata = original_xtdata
 
 
+class TestInstanceId:
+    """服务实例标识（instance_id）与订阅幂等辅助函数"""
+
+    def test_instance_id_is_nonempty_str(self):
+        from xqshare import server as server_mod
+        assert isinstance(server_mod._INSTANCE_ID, str)
+        assert len(server_mod._INSTANCE_ID) > 0
+
+    def test_exposed_get_instance_id(self):
+        from xqshare import server as server_mod
+        svc = XtQuantService()
+        assert svc.exposed_get_instance_id() == server_mod._INSTANCE_ID
+
+    def test_normalize_code_key(self):
+        from xqshare.server import _normalize_code_key
+        assert _normalize_code_key(["000001.SZ"]) == ("000001.SZ",)
+        assert _normalize_code_key(["SZ", "SH"]) == ("SH", "SZ")  # 排序去序
+        assert _normalize_code_key("000001.SZ") == ("000001.SZ",)
+        assert _normalize_code_key(("000001.SZ", "000002.SZ")) == ("000001.SZ", "000002.SZ")
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
