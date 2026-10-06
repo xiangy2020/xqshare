@@ -756,6 +756,7 @@ print(status)
 
 | 版本 | 日期 | 更新内容 |
 |------|------|----------|
+| 1.4.1 | 2026-10-06 | 修复 `create_trader_and_connect` 连接等待：不触发 `on_connected` 回调的 xtquant 版本（平安 QMT）不再空耗 10 秒，改为短间隔轮询 `query_stock_asset` 探活，秒级返回 |
 | 1.4.0 | 2026-10-03 | 新增 `get_instance_id()` 服务实例标识（轻量感知 server 重启）；行情订阅幂等（重复订阅自动释放旧 seq，阻断 miniquote 订阅累积泄漏） |
 | 1.1.1 | 2026-03-18 | 新增 xtview 模块支持（视图控制、调度任务管理），兼容不同 xtquant 版本 |
 | 1.1.0 | 2026-03-17 | 交易功能优化完善、`xqshare-server` 命令、`.env` 配置支持、远程对象传输性能优化 |

@@ -533,16 +533,9 @@ class _TraderConnectionCallback(_TraderEventCallback):
         super().on_disconnected()
         self._disconnected_event.set()
 
-    def wait_for_connected(self, timeout: float = 10.0) -> bool:
-        """等待交易连接建立
-
-        Args:
-            timeout: 最长等待时间（秒）
-
-        Returns:
-            True 表示连接成功，False 表示超时
-        """
-        return self._connected_event.wait(timeout)
+    def is_connected(self) -> bool:
+        """是否已收到 on_connected 回调（交易连接已建立）。"""
+        return self._connected_event.is_set()
 
 
 # ==================== Quote 行情事件回调透传 ====================
@@ -1374,6 +1367,49 @@ class XtQuantService(rpyc.Service):
             event_callback=event_callback
         )
 
+    def _wait_trader_connected(self, trader, callback, timeout: float) -> bool:
+        """等待 XtQuantTrader 交易连接真正建立。
+
+        connect() 是异步的，返回 0 仅代表请求已发出；真实连接靠 on_connected
+        回调确认。但部分 xtquant 版本（如平安 QMT）不触发该回调，若傻等回调会
+        空耗整个 timeout（默认 10 秒）。
+
+        因此改为短间隔轮询，任一信号成立即返回：
+
+        1. on_connected 回调已触发；
+        2. query_stock_asset 探活成功（返回非 None 资产）。
+
+        两者都未出现时才等到 timeout 结束，避免空耗。
+        """
+        account_id = os.environ.get("QMT_ACCOUNT_ID")
+        test_account = None
+        if account_id:
+            try:
+                from xtquant.xttype import StockAccount
+                test_account = StockAccount(account_id)
+            except Exception as e:
+                logger.warning(
+                    f"[Trader] 构造探活账户失败，仅依赖 on_connected 回调: {e}"
+                )
+
+        poll_interval = 0.3
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if callback.is_connected():
+                return True
+            if test_account is not None:
+                try:
+                    asset = trader.query_stock_asset(test_account)
+                    if asset is not None:
+                        logger.info("[Trader] query_stock_asset 探活成功，交易连接可用")
+                        return True
+                except Exception:
+                    # 连接尚未建立，继续轮询
+                    pass
+            time.sleep(poll_interval)
+
+        return callback.is_connected()
+
     @log_api_call("create_trader_and_connect")
     def exposed_create_trader_and_connect(
         self,
@@ -1441,24 +1477,9 @@ class XtQuantService(rpyc.Service):
                 }
                 raise ConnectionError(f"连接失败: {error_codes.get(connect_result, f'错误码 {connect_result}')}")
 
-            # 等待真实的交易连接建立
-            connected = callback.wait_for_connected(connect_timeout)
-            logger.info(f"[Trader] on_connected 回调状态: {connected}")
-            if not connected:
-                # 某些版本的 xtquant 可能不会触发 on_connected 回调，
-                # 尝试用 query_stock_asset 验证连接是否真正可用
-                logger.info("[Trader] on_connected 未触发，尝试 query_stock_asset 验证连接...")
-                try:
-                    from xtquant.xttype import StockAccount
-                    account_id = os.environ.get("QMT_ACCOUNT_ID")
-                    if account_id:
-                        test_account = StockAccount(account_id)
-                        asset = trader.query_stock_asset(test_account)
-                        logger.info(f"[Trader] query_stock_asset 验证成功: {asset}")
-                        connected = True
-                except Exception as e:
-                    logger.warning(f"[Trader] query_stock_asset 验证失败: {e}")
-
+            # 等待真实的交易连接建立（短间隔轮询，不傻等 on_connected 回调）
+            connected = self._wait_trader_connected(trader, callback, connect_timeout)
+            logger.info(f"[Trader] 交易连接建立: {connected}")
             if not connected:
                 raise TimeoutError(
                     f"等待交易连接建立超时（{connect_timeout}秒），"
