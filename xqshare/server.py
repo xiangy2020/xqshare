@@ -301,6 +301,21 @@ def _serialize_for_transfer(result):
     except ImportError:
         pass
 
+    # Series / ndarray: 转为 JSON（同样不能被包成 netref）
+    try:
+        import pandas as pd
+        if isinstance(result, pd.Series):
+            return {SERIALIZED_MARKER: "json", "data": json.dumps(result.to_dict(), ensure_ascii=False, default=str)}
+    except ImportError:
+        pass
+
+    try:
+        import numpy as np
+        if isinstance(result, np.ndarray):
+            return {SERIALIZED_MARKER: "json", "data": json.dumps(result.tolist(), ensure_ascii=False, default=str)}
+    except ImportError:
+        pass
+
     # 字典: 检查是否包含 DataFrame（递归检查）
     if isinstance(result, dict):
         try:
@@ -950,6 +965,14 @@ class LoggingProxy:
                     _seq = _deliver(result)
                     if isinstance(_seq, int):
                         quote_event_callback.record_subscription(get_client_info(), _sub_key, _seq)
+
+                # pandas/numpy 对象必须走序列化通道，禁止包成 netref：
+                # 客户端对 netref 做 np.asarray 会报
+                # "object __array__ method not producing an array"（除权因子踩坑）
+                if result is not None and type(result).__module__.split('.')[0] in ('pandas', 'numpy'):
+                    serialized = _serialize_for_transfer(result)
+                    if serialized is not result:
+                        return serialized
 
                 # 如果返回的是复杂对象（非基本类型），递归包装
                 if result is not None and hasattr(result, '__class__'):
